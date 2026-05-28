@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: worldcup-predictor
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m worldcup_predictor.web_server
+    healthCheckPath: /healthz
+    envVars:
+      - key: API_FOOTBALL_KEY
+        sync: false
+      - key: API_FOOTBALL_RETRIES
+        value: "3"
+      - key: WORLDCUP_PUBLIC_MODE
+        value: "true"
+      - key: WORLDCUP_ACCESS_USER
+        value: viewer
+      - key: WORLDCUP_ACCESS_PASSWORD
+        sync: false
+      - key: WORLDCUP_DB_PATH
+        value: /opt/render/project/src/storage/worldcup_predictor.sqlite3
+    disk:
+      name: worldcup-storage
+      mountPath: /opt/render/project/src/storage
+      sizeGB: 1

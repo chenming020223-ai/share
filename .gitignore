@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+storage/*.sqlite3
+storage/*.sqlite3-*
+artifacts/

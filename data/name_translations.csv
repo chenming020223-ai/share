@@ -1,0 +1,177 @@
+kind,name,zh
+team,Mexico,墨西哥
+team,USA,美国
+team,United States,美国
+team,Canada,加拿大
+team,Japan,日本
+team,Brazil,巴西
+team,France,法国
+team,Argentina,阿根廷
+team,England,英格兰
+team,Germany,德国
+team,Spain,西班牙
+team,Portugal,葡萄牙
+team,Italy,意大利
+team,Netherlands,荷兰
+team,Belgium,比利时
+team,Uruguay,乌拉圭
+team,Colombia,哥伦比亚
+team,Chile,智利
+team,Ecuador,厄瓜多尔
+team,Peru,秘鲁
+team,Paraguay,巴拉圭
+team,Bolivia,玻利维亚
+team,Venezuela,委内瑞拉
+team,Morocco,摩洛哥
+team,Senegal,塞内加尔
+team,Nigeria,尼日利亚
+team,Ghana,加纳
+team,Cameroon,喀麦隆
+team,Tunisia,突尼斯
+team,Algeria,阿尔及利亚
+team,Egypt,埃及
+team,South Africa,南非
+team,South Korea,韩国
+team,Korea Republic,韩国
+team,Australia,澳大利亚
+team,Saudi Arabia,沙特阿拉伯
+team,Iran,伊朗
+team,Qatar,卡塔尔
+team,Iraq,伊拉克
+team,Uzbekistan,乌兹别克斯坦
+team,China PR,中国
+team,China,中国
+team,Switzerland,瑞士
+team,Austria,奥地利
+team,Croatia,克罗地亚
+team,Serbia,塞尔维亚
+team,Denmark,丹麦
+team,Sweden,瑞典
+team,Norway,挪威
+team,Poland,波兰
+team,Czech Republic,捷克
+team,Czechia,捷克
+team,Turkey,土耳其
+team,Ukraine,乌克兰
+team,Scotland,苏格兰
+team,Wales,威尔士
+team,Republic of Ireland,爱尔兰
+team,Northern Ireland,北爱尔兰
+team,Greece,希腊
+team,Hungary,匈牙利
+team,Romania,罗马尼亚
+team,Slovakia,斯洛伐克
+team,Slovenia,斯洛文尼亚
+team,United Arab Emirates,阿联酋
+team,Jordan,约旦
+team,New Zealand,新西兰
+team,Costa Rica,哥斯达黎加
+team,Panama,巴拿马
+team,Jamaica,牙买加
+team,Honduras,洪都拉斯
+team,El Salvador,萨尔瓦多
+team,Napoli,那不勒斯
+team,Udinese,乌迪内斯
+team,Saint Etienne,圣埃蒂安
+team,Nice,尼斯
+team,Omarska,奥马尔斯卡
+team,FK Vlasenica,弗拉塞尼察
+team,Tobol 2,托博尔二队
+team,Taraz,塔拉兹
+country,Belarus,白俄罗斯
+country,England,英格兰
+country,Spain,西班牙
+country,Italy,意大利
+country,Germany,德国
+country,France,法国
+country,United States,美国
+country,USA,美国
+country,Mexico,墨西哥
+country,Canada,加拿大
+country,Japan,日本
+country,Kazakhstan,哈萨克斯坦
+country,Armenia,亚美尼亚
+country,Gabon,加蓬
+country,Ukraine,乌克兰
+country,Denmark,丹麦
+country,Ireland,爱尔兰
+country,Brazil,巴西
+country,Peru,秘鲁
+country,Bosnia,波黑
+team,Osipovichy,奥西波维奇
+team,Osipovichi,奥西波维奇
+team,Minsk II,明斯克二队
+team,Minsk 2,明斯克二队
+team,FC Minsk II,明斯克二队
+team,Shakhter Karagandy,卡拉干达矿工
+team,Yelimay Semey 2,叶利迈塞米二队
+team,Akademiya Ontustik,翁图斯季克学院
+team,Kaspij Aktau 2,卡斯皮阿克套二队
+team,Arys,阿雷斯
+team,Sport Academy Kairat,凯拉特体育学院
+team,Astana II,阿斯塔纳二队
+team,Khan Tengri,汗腾格里
+team,Andranik,安德拉尼克
+team,Araks Ararat,阿拉克斯阿拉拉特
+team,Banants II,巴南特斯二队
+team,Lernayin Artsakh,勒尔纳因阿尔察赫
+team,Van II,范城二队
+team,Pyunik II,埃里温凤凰二队
+team,Mangasport,曼加斯波特
+team,Oyem AC,奥耶姆竞技
+team,Stade Migoveen,米戈维恩体育
+team,Cercle Mbéri,姆贝里竞技
+team,US Oyem,奥耶姆联
+team,Bouenguidi,布恩吉迪
+league,World Cup,国际足联世界杯
+league,FIFA World Cup,国际足联世界杯
+league,World Cup - Qualification,世界杯预选赛
+league,World Cup - Qualification Europe,世界杯欧洲区预选赛
+league,World Cup - Qualification South America,世界杯南美区预选赛
+league,World Cup - Qualification CONCACAF,世界杯中北美及加勒比区预选赛
+league,World Cup - Qualification Asia,世界杯亚洲区预选赛
+league,World Cup - Qualification Africa,世界杯非洲区预选赛
+league,World Cup - Qualification Oceania,世界杯大洋洲区预选赛
+league,Friendlies,国际友谊赛
+league,Friendlies Women,国际女子友谊赛
+league,International Friendly,国际友谊赛
+league,FIFA Club World Cup,国际足联俱乐部世界杯
+league,UEFA Champions League,欧洲冠军联赛
+league,UEFA Europa League,欧足联欧洲联赛
+league,UEFA Europa Conference League,欧足联欧洲协会联赛
+league,UEFA Nations League,欧足联国家联赛
+league,Euro Championship,欧洲足球锦标赛
+league,Copa America,美洲杯
+league,Africa Cup of Nations,非洲国家杯
+league,AFC Asian Cup,亚洲杯
+league,CONCACAF Gold Cup,中北美及加勒比金杯赛
+league,CONMEBOL Libertadores,南美解放者杯
+league,CONMEBOL Sudamericana,南美俱乐部杯
+league,Premier League,英格兰足球超级联赛
+league,Championship,英格兰足球冠军联赛
+league,FA Cup,英格兰足总杯
+league,La Liga,西班牙足球甲级联赛
+league,Copa del Rey,西班牙国王杯
+league,Serie A,意大利足球甲级联赛
+league,Coppa Italia,意大利杯
+league,Bundesliga,德国足球甲级联赛
+league,DFB Pokal,德国杯
+league,Ligue 1,法国足球甲级联赛
+league,Coupe de France,法国杯
+league,Eredivisie,荷兰足球甲级联赛
+league,Primeira Liga,葡萄牙足球超级联赛
+league,Major League Soccer,美国职业足球大联盟
+league,Liga MX,墨西哥足球超级联赛
+league,Brazilian Serie A,巴西足球甲级联赛
+league,Serie A Brazil,巴西足球甲级联赛
+league,Primera División Argentina,阿根廷足球甲级联赛
+league,J1 League,日本职业足球甲级联赛
+league,K League 1,韩国职业足球甲级联赛
+league,Chinese Super League,中国足球协会超级联赛
+league,Belarus 1. Division,白俄罗斯足球甲级联赛
+league,Kazakhstan 1. Division,哈萨克斯坦足球甲级联赛
+league,Bosnia 1st League - RS,波黑塞族共和国足球甲级联赛
+league,Armenia First League,亚美尼亚足球甲级联赛
+league,Gabon Championnat D1,加蓬足球甲级联赛
+league,Brazil Serie A,巴西足球甲级联赛
+league,1. Division,足球甲级联赛
