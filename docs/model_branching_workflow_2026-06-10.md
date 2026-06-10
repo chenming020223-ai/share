@@ -44,6 +44,18 @@ cd /Users/hcm/Documents/世界杯预测_调整版
 ./start_worldcup_predictor.command
 ```
 
+实验版默认访问地址：
+
+```bash
+http://127.0.0.1:8766
+```
+
+稳定版默认访问地址仍为：
+
+```bash
+http://127.0.0.1:8765
+```
+
 回到稳定版：
 
 ```bash

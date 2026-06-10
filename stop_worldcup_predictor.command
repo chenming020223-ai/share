@@ -3,10 +3,10 @@ set -e
 
 cd "$(dirname "$0")"
 
-PORT="${WORLDCUP_WEB_PORT:-8765}"
+PORT="${WORLDCUP_WEB_PORT:-8766}"
 PID_FILE="storage/web_server.pid"
-SERVICE_LABEL="com.worldcup.predictor.web"
-SCREEN_NAME="worldcup_predictor_web"
+SERVICE_LABEL="com.worldcup.predictor.web.v2"
+SCREEN_NAME="worldcup_predictor_web_v2"
 PLIST_FILE="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
 
 STOPPED=0
