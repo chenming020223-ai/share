@@ -4,7 +4,7 @@ import math
 
 from .models import Fixture, ModelConfig, PredictionResult, TeamProfile, clamp
 from .odds import blend_probabilities, devig_three_way
-from .poisson import result_probabilities, score_matrix, top_scorelines
+from .poisson import result_probabilities, score_matrix, score_matrix_probability_sum, top_scorelines
 
 
 def predict_match(
@@ -27,14 +27,26 @@ def predict_match(
     home_rate *= math.exp(log_edge)
     away_rate *= math.exp(-log_edge)
 
-    home_rate = clamp(home_rate, 0.15, 4.5)
-    away_rate = clamp(away_rate, 0.15, 4.5)
+    raw_home_rate = clamp(home_rate, 0.15, 4.5)
+    raw_away_rate = clamp(away_rate, 0.15, 4.5)
+    shrink_factor = clamp(config.lambda_shrink_factor, 0.35, 1.0)
+    home_rate = clamp(raw_home_rate * shrink_factor, 0.15, 4.5)
+    away_rate = clamp(raw_away_rate * shrink_factor, 0.15, 4.5)
 
     matrix = score_matrix(home_rate, away_rate, config.max_goals)
+    matrix_prob_sum = score_matrix_probability_sum(home_rate, away_rate, config.max_goals)
     draw_boost = feature_edges["rivalry_draw_boost"]
     model_probs = result_probabilities(matrix, draw_boost=draw_boost)
     market_probs = devig_three_way(fixture.odds_home, fixture.odds_draw, fixture.odds_away)
     final_probs = blend_probabilities(model_probs, market_probs, config.market_weight)
+    lambda_total = home_rate + away_rate
+    lambda_risk_flags: list[str] = []
+    if matrix_prob_sum < 0.995:
+        lambda_risk_flags.append("POISSON_TAIL_RISK")
+    if lambda_total >= 3.80:
+        lambda_risk_flags.append("EXTREME_TOTAL_GOALS_LAMBDA")
+    elif lambda_total >= 3.30:
+        lambda_risk_flags.append("HIGH_TOTAL_GOALS_LAMBDA")
 
     return PredictionResult(
         match_id=fixture.match_id,
@@ -48,6 +60,14 @@ def predict_match(
         top_scores=top_scorelines(matrix),
         feature_edges=feature_edges,
         notes=fixture.notes,
+        raw_expected_goals_home=raw_home_rate,
+        raw_expected_goals_away=raw_away_rate,
+        lambda_shrink_factor=shrink_factor,
+        lambda_shrink_reasons=config.lambda_shrink_reasons,
+        score_matrix_max_goals=config.max_goals,
+        score_matrix_probability_sum=matrix_prob_sum,
+        score_matrix_tail_mass=max(0.0, 1.0 - matrix_prob_sum),
+        lambda_risk_flags=tuple(lambda_risk_flags),
     )
 
 

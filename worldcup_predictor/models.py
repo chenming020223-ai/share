@@ -150,8 +150,10 @@ class Fixture:
 @dataclass(frozen=True)
 class ModelConfig:
     base_goals: float = 1.28
-    max_goals: int = 8
+    max_goals: int = 10
     market_weight: float = 0.45
+    lambda_shrink_factor: float = 1.0
+    lambda_shrink_reasons: tuple[str, ...] = ()
     strength_weight: float = 0.36
     rank_weight: float = 0.16
     host_weight: float = 0.11
@@ -178,3 +180,11 @@ class PredictionResult:
     top_scores: list[tuple[str, float]]
     feature_edges: dict[str, float]
     notes: str = ""
+    raw_expected_goals_home: float | None = None
+    raw_expected_goals_away: float | None = None
+    lambda_shrink_factor: float = 1.0
+    lambda_shrink_reasons: tuple[str, ...] = ()
+    score_matrix_max_goals: int = 10
+    score_matrix_probability_sum: float | None = None
+    score_matrix_tail_mass: float | None = None
+    lambda_risk_flags: tuple[str, ...] = ()

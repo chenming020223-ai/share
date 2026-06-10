@@ -6,8 +6,15 @@ TWO_WAY_IMPLIED_MIN = 0.98
 TWO_WAY_IMPLIED_MAX = 1.25
 
 
-def devig_three_way(home_odds: float, draw_odds: float, away_odds: float) -> dict[str, float] | None:
+def devig_three_way(
+    home_odds: float,
+    draw_odds: float,
+    away_odds: float,
+    margin_method: str = "proportional",
+) -> dict[str, float] | None:
     """Convert decimal 1X2 odds into no-margin probabilities."""
+    if margin_method != "proportional":
+        return None
     if home_odds <= 1.0 or draw_odds <= 1.0 or away_odds <= 1.0:
         return None
 
@@ -43,8 +50,11 @@ def devig_two_way(
     second_odds: float,
     first_key: str = "first",
     second_key: str = "second",
+    margin_method: str = "proportional",
 ) -> dict[str, float] | None:
     """Convert decimal two-way odds into no-margin probabilities."""
+    if margin_method != "proportional":
+        return None
     if first_odds <= 1.0 or second_odds <= 1.0:
         return None
 

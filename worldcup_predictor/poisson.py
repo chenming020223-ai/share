@@ -22,6 +22,15 @@ def score_matrix(home_rate: float, away_rate: float, max_goals: int) -> dict[tup
     return matrix
 
 
+def score_matrix_probability_sum(home_rate: float, away_rate: float, max_goals: int) -> float:
+    retained = 0.0
+    for home_goals in range(max_goals + 1):
+        home_prob = poisson_pmf(home_goals, home_rate)
+        for away_goals in range(max_goals + 1):
+            retained += home_prob * poisson_pmf(away_goals, away_rate)
+    return retained
+
+
 def result_probabilities(matrix: dict[tuple[int, int], float], draw_boost: float = 0.0) -> dict[str, float]:
     probs = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
     for (home_goals, away_goals), probability in matrix.items():

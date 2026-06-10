@@ -5,6 +5,8 @@ from worldcup_predictor.odds import devig_three_way, devig_two_way
 from worldcup_predictor.predictor import predict_match
 from worldcup_predictor.market import MarketSnapshot, parse_api_football_odds
 from worldcup_predictor.poisson import score_matrix
+from worldcup_predictor.risk import build_match_risk_context
+from worldcup_predictor.bankroll import dynamic_unit_stake
 from worldcup_predictor.betting import (
     asian_handicap_positive_return_probability,
     asian_total_positive_return_probability,
@@ -75,6 +77,87 @@ class PredictorTest(unittest.TestCase):
         self.assertEqual(snapshot.match_winner["home_win"], 2.00)
         self.assertEqual(snapshot.best_total_line()[0], 2.5)
         self.assertEqual(snapshot.best_handicap_line()[0], -0.5)
+
+    def test_bookmaker_priority_falls_back_without_cross_market_averaging(self):
+        rows = [
+            {
+                "fixture": {"id": 101},
+                "update": "2026-05-25T00:00:00+00:00",
+                "bookmakers": [
+                    {
+                        "name": "Pinnacle",
+                        "bets": [
+                            {
+                                "name": "Match Winner",
+                                "values": [
+                                    {"value": "Home", "odd": "2.00"},
+                                    {"value": "Away", "odd": "3.80"},
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Bet365",
+                        "bets": [
+                            {
+                                "name": "Match Winner",
+                                "values": [
+                                    {"value": "Home", "odd": "2.10"},
+                                    {"value": "Draw", "odd": "3.30"},
+                                    {"value": "Away", "odd": "3.60"},
+                                ],
+                            },
+                            {
+                                "name": "Goals Over/Under",
+                                "values": [
+                                    {"value": "Over 2.5", "odd": "1.90"},
+                                    {"value": "Under 2.5", "odd": "1.96"},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            }
+        ]
+
+        snapshot = parse_api_football_odds(rows, required_bookmaker=None, bookmaker_priority=["Pinnacle", "Bet365"])
+
+        self.assertEqual(snapshot.selected_bookmakers["1X2"], "Bet365")
+        self.assertEqual(snapshot.selected_bookmakers["OU"], "Bet365")
+        self.assertEqual(snapshot.match_winner["home_win"], 2.10)
+        self.assertTrue(any("回退使用 Bet365" in item for item in snapshot.warnings))
+
+    def test_total_market_never_pairs_different_bookmakers(self):
+        rows = [
+            {
+                "fixture": {"id": 102},
+                "bookmakers": [
+                    {
+                        "name": "Bet365",
+                        "bets": [
+                            {
+                                "name": "Goals Over/Under",
+                                "values": [{"value": "Over 2.5", "odd": "1.91"}],
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Betfair",
+                        "bets": [
+                            {
+                                "name": "Goals Over/Under",
+                                "values": [{"value": "Under 2.5", "odd": "1.95"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ]
+
+        snapshot = parse_api_football_odds(rows, required_bookmaker=None, bookmaker_priority=["Bet365", "Betfair"])
+
+        self.assertIsNone(snapshot.best_total_line())
+        self.assertNotIn("OU", snapshot.selected_bookmakers)
 
     def test_total_market_requires_same_bookmaker_pair(self):
         rows = [
@@ -285,6 +368,13 @@ class PredictorTest(unittest.TestCase):
         self.assertLess(recommendations[0].conservative_expected_value_per_unit, 0)
         self.assertEqual(portfolio.active_bets, 0)
 
+    def test_zero_unit_stake_uses_dynamic_five_part_bankroll_plan(self):
+        plan = dynamic_unit_stake(1000)
+
+        self.assertEqual(plan.unit_stake, 200)
+        self.assertEqual(dynamic_unit_stake(1200).unit_stake, 220)
+        self.assertEqual(dynamic_unit_stake(800).unit_stake, 160)
+
     def test_low_probability_1x2_direction_is_never_buy_signal(self):
         result = PredictionResult(
             match_id="101",
@@ -326,7 +416,7 @@ class PredictorTest(unittest.TestCase):
 
         self.assertEqual(recommendations[0].selection, "B 胜")
         self.assertEqual(recommendations[0].action, "WATCH")
-        self.assertIn("复核上限", recommendations[0].reason)
+        self.assertIn("模型分歧异常", recommendations[0].reason)
         self.assertEqual(portfolio.active_bets, 0)
 
     def test_pinnacle_1x2_model_divergence_suspends_ev_for_all_markets(self):
@@ -358,10 +448,114 @@ class PredictorTest(unittest.TestCase):
         )
 
         self.assertTrue(all(item.action == "WATCH" for item in recommendations))
-        self.assertTrue(all(item.ev_status == "SUSPENDED_MODEL_DIVERGENCE" for item in recommendations))
+        self.assertTrue(all(item.signal_status == "SUSPENDED" for item in recommendations))
+        self.assertTrue(all(item.ev_status == "MODEL_MARKET_CONFLICT" for item in recommendations))
         self.assertTrue(all(item.expected_value_per_unit is None for item in recommendations))
         self.assertAlmostEqual(recommendations[0].audit_expected_value_per_unit, 0.6314326233)
+        self.assertAlmostEqual(recommendations[0].ev_pbase_research, 0.6314326233)
+        self.assertIsNone(recommendations[0].ev_pfinal_exec)
         self.assertIn("本场所有市场 EV 暂停计算", recommendations[1].reason)
+        self.assertEqual(portfolio.total_stake, 0)
+
+    def test_single_market_probability_gap_suspends_that_market_ev_only(self):
+        result = PredictionResult(
+            match_id="1548442",
+            home_team="Kosovo U21",
+            away_team="Luxembourg U21",
+            expected_goals_home=2.77,
+            expected_goals_away=1.40,
+            model_probabilities={
+                "home_win": 0.6606957400993966,
+                "draw": 0.16610935701704246,
+                "away_win": 0.173194902883561,
+            },
+            market_probabilities=None,
+            final_probabilities={
+                "home_win": 0.5945934556788263,
+                "draw": 0.20827924339090786,
+                "away_win": 0.19712730093026581,
+            },
+            top_scores=[],
+            feature_edges={},
+        )
+        market = MarketSnapshot(
+            selected_bookmaker="Pinnacle",
+            match_winner={"home_win": 1.78, "draw": 3.52, "away_win": 4.04},
+            totals={2.5: {"over": 1.83, "under": 1.96}},
+            handicaps={-0.5: {"home": 1.79, "away": 2.01}},
+        )
+
+        recommendations, portfolio = build_recommendations(
+            result,
+            score_matrix(result.expected_goals_home, result.expected_goals_away, 8),
+            market,
+            unit_stake=10,
+        )
+
+        total_goals = recommendations[1]
+        self.assertEqual(total_goals.market, "大小球")
+        self.assertEqual(total_goals.action, "WATCH")
+        self.assertEqual(total_goals.signal_status, "SUSPENDED")
+        self.assertEqual(total_goals.ev_status, "MODEL_MARKET_CONFLICT")
+        self.assertIsNone(total_goals.expected_value_per_unit)
+        self.assertGreater(total_goals.audit_expected_value_per_unit, 0.40)
+        self.assertGreater(abs(total_goals.edge), 0.15)
+        self.assertIn("异常观察池", total_goals.reason)
+        self.assertNotEqual(recommendations[0].ev_status, "MODEL_MARKET_CONFLICT")
+        self.assertEqual(portfolio.active_bets, 0)
+
+    def test_youth_friendly_missing_stats_blocks_score_markets(self):
+        result = PredictionResult(
+            match_id="1548442",
+            home_team="Kosovo U21",
+            away_team="Luxembourg U21",
+            expected_goals_home=2.77,
+            expected_goals_away=1.40,
+            model_probabilities={
+                "home_win": 0.6606957400993966,
+                "draw": 0.16610935701704246,
+                "away_win": 0.173194902883561,
+            },
+            market_probabilities=None,
+            final_probabilities={
+                "home_win": 0.5945934556788263,
+                "draw": 0.20827924339090786,
+                "away_win": 0.19712730093026581,
+            },
+            top_scores=[],
+            feature_edges={},
+        )
+        market = MarketSnapshot(
+            selected_bookmaker="Pinnacle",
+            match_winner={"home_win": 1.78, "draw": 3.52, "away_win": 4.04},
+            totals={2.5: {"over": 1.83, "under": 1.96}},
+            handicaps={-0.5: {"home": 1.79, "away": 2.01}},
+        )
+        risk_context = build_match_risk_context(
+            home_team="Kosovo U21",
+            away_team="Luxembourg U21",
+            league_name="International Friendlies",
+            collection_mode="deep",
+            deep_stats_matches=0,
+            home_recent_matches=10,
+            away_recent_matches=10,
+        )
+
+        recommendations, portfolio = build_recommendations(
+            result,
+            score_matrix(result.expected_goals_home, result.expected_goals_away, 10),
+            market,
+            unit_stake=10,
+            risk_context=risk_context,
+        )
+
+        self.assertEqual(recommendations[0].action, "WATCH")
+        self.assertLessEqual(recommendations[0].shrink_k, 0.0)
+        self.assertEqual(recommendations[1].decision_status, "MODEL_MARKET_CONFLICT")
+        self.assertEqual(recommendations[2].decision_status, "SUSPENDED")
+        self.assertIn("U21_RISK_DISCOUNT", recommendations[1].risk_flags)
+        self.assertIn("EXTREME_TOTAL_GOALS_LAMBDA", recommendations[1].risk_flags)
+        self.assertIn("HANDICAP_MARGIN_DISTRIBUTION_NOT_CALIBRATED", recommendations[2].risk_flags)
         self.assertEqual(portfolio.total_stake, 0)
 
     def test_betting_probability_helpers_are_bounded(self):
@@ -372,6 +566,121 @@ class PredictorTest(unittest.TestCase):
 
         self.assertTrue(0.0 <= over_probability <= 1.0)
         self.assertTrue(0.0 <= home_cover_probability <= 1.0)
+
+    def test_1x2_ev_calculation_path_is_auditable(self):
+        result = PredictionResult(
+            match_id="103",
+            home_team="Napoli",
+            away_team="Udinese",
+            expected_goals_home=1.99,
+            expected_goals_away=1.32,
+            model_probabilities={"home_win": 0.58, "draw": 0.19, "away_win": 0.23},
+            market_probabilities=None,
+            final_probabilities={"home_win": 0.58, "draw": 0.19, "away_win": 0.23},
+            top_scores=[],
+            feature_edges={},
+        )
+        market = MarketSnapshot(match_winner={"home_win": 1.45, "draw": 4.0, "away_win": 7.56})
+
+        recommendations, _ = build_recommendations(result, {}, market, unit_stake=10)
+        calculation = recommendations[0].ev_calculation
+
+        self.assertEqual(recommendations[0].selection, "Udinese 胜")
+        self.assertAlmostEqual(recommendations[0].expected_value_per_unit, 0.7388)
+        self.assertAlmostEqual(recommendations[0].ev_pbase_research, 0.7388)
+        self.assertIsNone(recommendations[0].ev_pfinal_exec)
+        self.assertEqual(recommendations[0].ev_layer, "pbase_research")
+        self.assertEqual(recommendations[0].model_probability_label, "模型胜率")
+        self.assertEqual(recommendations[0].ev_probability_basis, "pbase_result_probability")
+        self.assertEqual(calculation["evLayer"], "pbase_research")
+        self.assertEqual(calculation["modelProbabilityLabel"], "模型胜率")
+        self.assertEqual(calculation["evProbabilityBasis"], "pbase_result_probability")
+        self.assertFalse(calculation["formalExecutionEnabled"])
+        self.assertEqual(calculation["formula"], "EV = pbase × odds - 1")
+        self.assertAlmostEqual(calculation["winStakeFraction"], 0.23)
+        self.assertAlmostEqual(calculation["lossStakeFraction"], 0.77)
+        self.assertAlmostEqual(calculation["breakEvenOdds"], 1 / 0.23)
+        self.assertTrue(any(gate["key"] == "model_probability" and not gate["passed"] for gate in calculation["gates"]))
+
+    def test_asian_total_ev_path_splits_half_loss_and_break_even_odds(self):
+        result = PredictionResult(
+            match_id="104",
+            home_team="A",
+            away_team="B",
+            expected_goals_home=1.0,
+            expected_goals_away=1.0,
+            model_probabilities={"home_win": 0.34, "draw": 0.30, "away_win": 0.36},
+            market_probabilities=None,
+            final_probabilities={"home_win": 0.34, "draw": 0.30, "away_win": 0.36},
+            top_scores=[],
+            feature_edges={},
+        )
+        score_probs = {
+            (3, 0): 0.50,
+            (2, 0): 0.25,
+            (1, 0): 0.25,
+        }
+        market = MarketSnapshot(totals={2.25: {"over": 2.0, "under": 2.0}})
+
+        recommendations, _ = build_recommendations(result, score_probs, market, unit_stake=10)
+        total = recommendations[1]
+        settlement = total.ev_calculation["settlement"]
+
+        self.assertEqual(total.selection, "大 2.25")
+        self.assertEqual(total.model_probability_label, "正收益概率")
+        self.assertEqual(total.ev_probability_basis, "asian_settlement_weight")
+        self.assertEqual(total.ev_calculation["modelProbabilityLabel"], "正收益概率")
+        self.assertEqual(total.ev_calculation["evProbabilityBasis"], "asian_settlement_weight")
+        self.assertAlmostEqual(total.expected_value_per_unit, 0.125)
+        self.assertIsNone(total.paper_expected_value_per_unit)
+        self.assertIsNone(total.adjusted_probability)
+        self.assertIsNone(total.shrink_k)
+        self.assertEqual(total.ev_calculation["evDecisionLayer"], "research_audit_only")
+        self.assertIsNone(total.ev_calculation["paperExpectedValue"])
+        self.assertTrue(any(gate["key"] == "paper_ev" and not gate["enabled"] for gate in total.ev_calculation["gates"]))
+        self.assertIn("SCORE_DISTRIBUTION_NOT_VALIDATED", total.risk_flags)
+        self.assertIn("比分分布层尚未完成独立校准", total.reason)
+        self.assertAlmostEqual(total.ev_calculation["positiveReturnProbability"], 0.50)
+        self.assertAlmostEqual(settlement["fullWinProbability"], 0.50)
+        self.assertAlmostEqual(settlement["halfLossProbability"], 0.25)
+        self.assertAlmostEqual(settlement["fullLossProbability"], 0.25)
+        self.assertAlmostEqual(total.ev_calculation["winStakeFraction"], 0.50)
+        self.assertAlmostEqual(total.ev_calculation["lossStakeFraction"], 0.375)
+        self.assertAlmostEqual(total.ev_calculation["breakEvenOdds"], 1.75)
+
+    def test_single_match_exposure_cap_scales_multiple_paper_signals(self):
+        result = PredictionResult(
+            match_id="105",
+            home_team="A",
+            away_team="B",
+            expected_goals_home=1.4,
+            expected_goals_away=1.2,
+            model_probabilities={"home_win": 0.45, "draw": 0.25, "away_win": 0.30},
+            market_probabilities=None,
+            final_probabilities={"home_win": 0.45, "draw": 0.25, "away_win": 0.30},
+            top_scores=[],
+            feature_edges={},
+        )
+        market = MarketSnapshot(
+            match_winner={"home_win": 2.30, "draw": 3.50, "away_win": 3.20},
+            totals={2.5: {"over": 1.95, "under": 1.95}},
+            handicaps={0.0: {"home": 1.95, "away": 1.95}},
+        )
+
+        recommendations, portfolio = build_recommendations(
+            result,
+            score_matrix(1.4, 1.2, 8),
+            market,
+            bankroll=1000,
+            unit_stake=200,
+            force_picks=True,
+        )
+
+        active = [item for item in recommendations if item.action in {"BUY", "PAPER_BUY"}]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(recommendations[1].decision_status, "RESEARCH_OBSERVATION")
+        self.assertEqual(recommendations[2].decision_status, "RESEARCH_OBSERVATION")
+        self.assertAlmostEqual(portfolio.total_stake, 200.0)
 
 
 if __name__ == "__main__":

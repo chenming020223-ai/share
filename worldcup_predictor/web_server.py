@@ -22,6 +22,7 @@ from .betting import DEFAULT_MIN_EDGE, build_distribution_audit, build_recommend
 from .calibration import MARKET_DATASET_VERSION, PBASE_MODEL_VERSION, build_model_validation_status
 from .data_quality import apply_quality_gate, build_data_quality_report
 from .data import load_fixtures, load_teams
+from .data_layer import CachedApiFootballClient
 from .localization import (
     is_first_division_league,
     localize_selection,
@@ -32,23 +33,35 @@ from .localization import (
     translate_name,
     translate_team_display,
 )
+from .live_readiness import build_live_readiness_status
 from .market import MarketSnapshot
 from .model_governance import sample_model_governance
 from .models import ModelConfig, as_bool, as_float, clamp
 from .predictor import predict_match
 from .poisson import score_matrix
 from .report import build_chinese_report, build_excel_report, build_pdf_report
+from .review import build_daily_review, build_daily_review_excel
 from .settings import env_bool, env_int, env_str
 from .storage import (
+    get_batch_prediction_payload,
     get_prediction_payload,
+    mark_official_batch,
+    recent_batch_predictions,
     recent_predictions,
     record_api_snapshot,
+    record_batch_prediction,
     record_prediction,
+    settle_open_paper_ledger,
     storage_health,
+    update_batch_metadata,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = PROJECT_ROOT / "web"
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=env_int("WORLDCUP_WEB_PORT", env_int("PORT", 8765)))
     args = parser.parse_args(argv)
 
-    server = ThreadingHTTPServer((args.host, args.port), PredictorWebHandler)
+    server = ReusableThreadingHTTPServer((args.host, args.port), PredictorWebHandler)
     print(f"World Cup predictor web app: http://{args.host}:{args.port}")
     try:
         server.serve_forever()
@@ -71,6 +84,26 @@ def main(argv: list[str] | None = None) -> int:
 
 class PredictorWebHandler(BaseHTTPRequestHandler):
     server_version = "WorldCupPredictor/0.1"
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/healthz":
+            self._send_json({"ok": True, "app": "worldcup-predictor"}, write_body=False)
+            return
+        if not self._authorize_request():
+            return
+        if path in {"/", "/index.html"}:
+            self._serve_static(WEB_ROOT / "index.html", write_body=False)
+            return
+        static_path = (WEB_ROOT / path.lstrip("/")).resolve()
+        if WEB_ROOT.resolve() not in static_path.parents and static_path != WEB_ROOT.resolve():
+            self._send_error(HTTPStatus.FORBIDDEN, "Forbidden", write_body=False)
+            return
+        if static_path.exists() and static_path.is_file():
+            self._serve_static(static_path, write_body=False)
+            return
+        self._send_error(HTTPStatus.NOT_FOUND, "Not found", write_body=False)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
         parsed = urllib.parse.urlparse(self.path)
@@ -95,8 +128,55 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
         if path == "/api/model-validation":
             self._send_json(build_model_validation_status())
             return
+        if path == "/api/live-readiness":
+            self._send_json(build_live_readiness_status())
+            return
+        if path == "/api/daily-review":
+            query = urllib.parse.parse_qs(parsed.query)
+            date = (query.get("date") or [_today_shanghai()])[0]
+            batch_id = _optional_int((query.get("batch_id") or [""])[0])
+            self._send_json(build_daily_review(date=date, batch_id=batch_id))
+            return
+        if path == "/api/daily-review-report":
+            query = urllib.parse.parse_qs(parsed.query)
+            date = (query.get("date") or [_today_shanghai()])[0]
+            batch_id = _optional_int((query.get("batch_id") or [""])[0])
+            review = build_daily_review(date=date, batch_id=batch_id)
+            self._send_file(
+                build_daily_review_excel(review),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                f"worldcup_review_{date}.xlsx",
+            )
+            return
         if path == "/api/recent-predictions":
             self._send_json({"runs": recent_prediction_options()})
+            return
+        if path == "/api/recent-batches":
+            self._send_json({"batches": recent_batch_options()})
+            return
+        if path == "/api/batch-run":
+            query = urllib.parse.parse_qs(parsed.query)
+            batch_id = _optional_int((query.get("batch_id") or [""])[0])
+            if not batch_id:
+                self._send_error(HTTPStatus.BAD_REQUEST, "Missing batch_id")
+                return
+            payload = get_batch_prediction_payload(batch_id)
+            if not payload:
+                self._send_error(HTTPStatus.NOT_FOUND, "Batch not found")
+                return
+            self._send_json(payload)
+            return
+        if path == "/api/prediction":
+            query = urllib.parse.parse_qs(parsed.query)
+            run_id = _optional_int((query.get("run_id") or [""])[0])
+            if not run_id:
+                self._send_error(HTTPStatus.BAD_REQUEST, "Missing run_id")
+                return
+            payload = get_prediction_payload(run_id)
+            if not payload:
+                self._send_error(HTTPStatus.NOT_FOUND, "Prediction not found")
+                return
+            self._send_json(payload)
             return
         if path == "/api/search-fixtures":
             try:
@@ -163,7 +243,16 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
         if not self._authorize_request():
             return
-        if self.path not in {"/api/predict", "/api/random-today-predict", "/api/search-fixtures", "/api/today-fixtures", "/api/sync-results"}:
+        if self.path not in {
+            "/api/predict",
+            "/api/random-today-predict",
+            "/api/search-fixtures",
+            "/api/today-fixtures",
+            "/api/batch-predict",
+            "/api/update-batch",
+            "/api/mark-official-batch",
+            "/api/sync-results",
+        }:
             self._send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
 
@@ -193,8 +282,43 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
                 sync_result = sync_completed_results(
                     api_key=_api_key_from_request(payload),
                 )
+                sync_result["paperLedger"] = settle_open_paper_ledger()
                 sync_result["modelValidation"] = build_model_validation_status()
                 self._send_json(sync_result)
+                return
+            if self.path == "/api/mark-official-batch":
+                batch_id = _optional_int(payload.get("batchId") or payload.get("batch_id"))
+                if not batch_id:
+                    self._send_error(HTTPStatus.BAD_REQUEST, "Missing batch_id")
+                    return
+                updated = mark_official_batch(
+                    batch_id,
+                    official_date=str(payload.get("officialDate") or payload.get("date") or ""),
+                )
+                if not updated:
+                    self._send_error(HTTPStatus.NOT_FOUND, "Batch not found")
+                    return
+                self._send_json({"ok": True, "batch": updated})
+                return
+            if self.path == "/api/update-batch":
+                batch_id = _optional_int(payload.get("batchId") or payload.get("batch_id"))
+                if not batch_id:
+                    self._send_error(HTTPStatus.BAD_REQUEST, "Missing batch_id")
+                    return
+                updated = update_batch_metadata(
+                    batch_id,
+                    title=str(payload.get("title") or ""),
+                    notes=str(payload.get("notes") or ""),
+                )
+                if not updated:
+                    self._send_error(HTTPStatus.NOT_FOUND, "Batch not found")
+                    return
+                self._send_json({"ok": True, "batch": updated})
+                return
+            if self.path == "/api/batch-predict":
+                batch_result = run_batch_prediction(payload)
+                batch_result["batchRunId"] = record_batch_prediction(batch_result)
+                self._send_json(batch_result)
                 return
             result = run_random_today_prediction(payload) if self.path == "/api/random-today-predict" else run_web_prediction(payload)
             result["runId"] = record_prediction(result)
@@ -237,25 +361,33 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return False
 
-    def _serve_static(self, path: Path) -> None:
+    def _serve_static(self, path: Path, *, write_body: bool = True) -> None:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if write_body:
+            self.wfile.write(body)
 
-    def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+        *,
+        write_body: bool = True,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if write_body:
+            self.wfile.write(body)
 
-    def _send_error(self, status: HTTPStatus, message: str) -> None:
-        self._send_json({"error": message}, status=status)
+    def _send_error(self, status: HTTPStatus, message: str, *, write_body: bool = True) -> None:
+        self._send_json({"error": message}, status=status, write_body=write_body)
 
     def _send_api_error(self, exc: ApiFootballError) -> None:
         status = _api_error_status(exc)
@@ -279,7 +411,7 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def run_web_prediction(payload: dict[str, Any]) -> dict[str, Any]:
+def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None = None) -> dict[str, Any]:
     mode = str(payload.get("mode") or "sample")
     bankroll = as_float(payload.get("bankroll"), 1000.0)
     unit = _optional_float(payload.get("unit"))
@@ -299,18 +431,21 @@ def run_web_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             away_value,
             api_key=_api_key_from_request(payload),
             fixture_id=fixture_id,
+            collection_mode=str(payload.get("collectionMode") or ""),
             market_weight=market_weight,
             bankroll=bankroll,
             unit_stake=unit,
             min_edge=min_edge,
             force_picks=force_picks,
+            bookmaker_priority=payload.get("bookmakerPriority"),
+            client=client,
         )
         quality = build_data_quality_report(
             auto.market,
             fixture_id=auto.fixture_id,
             team_rating_score=1.0 if auto.recent_form_available else 0.25,
             context_score=0.75 if auto.league_id and auto.season and auto.kickoff else 0.45,
-            lineup_score=0.0,
+            lineup_score=0.30 if auto.deep_stats_available else 0.0,
             min_quality=min_quality,
             max_score=_quality_cap_for_recent_form(auto.recent_form_available, min_quality),
         )
@@ -336,11 +471,20 @@ def run_web_prediction(payload: dict[str, Any]) -> dict[str, Any]:
                 "dataSource": "API-Football",
                 "snapshotId": snapshot_id,
                 "requiredBookmaker": auto.market.required_bookmaker or "-",
+                "bookmakerPriority": auto.market.bookmaker_priority,
+                "selectedBookmakers": auto.market.selected_bookmakers,
                 "bookmaker": auto.market.selected_bookmaker or "未取得",
                 "oddsCapturedAt": auto.market.captured_at or "",
                 "oddsCapturedAtBeijing": to_beijing_time(auto.market.captured_at or ""),
                 "marketDatasetVersion": MARKET_DATASET_VERSION,
                 "pbaseModelVersion": PBASE_MODEL_VERSION,
+                "collectionMode": auto.collection_mode,
+                "collectionModeZh": _collection_mode_zh(auto.collection_mode),
+                "deepStatsMatches": auto.deep_stats_matches,
+                "apiLogicalRequests": auto.api_logical_requests,
+                "apiHttpAttempts": auto.api_http_attempts,
+                "apiCacheHits": auto.api_cache_hits,
+                "apiCacheMisses": auto.api_cache_misses,
                 "recentMatchesHome": auto.home_recent_matches,
                 "recentMatchesAway": auto.away_recent_matches,
                 "recentMatchesRequired": MIN_VALID_RECENT_MATCHES,
@@ -357,6 +501,7 @@ def run_web_prediction(payload: dict[str, Any]) -> dict[str, Any]:
                 auto.data_notes,
                 quality,
                 auto.governance,
+                auto.risk_context,
             ),
         }
 
@@ -400,18 +545,20 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
         str(away),
         api_key=_api_key_from_request(payload),
         fixture_id=fixture_id,
+        collection_mode=str(payload.get("collectionMode") or ""),
         market_weight=market_weight,
         bankroll=bankroll,
         unit_stake=unit,
         min_edge=min_edge,
         force_picks=False,
+        bookmaker_priority=payload.get("bookmakerPriority"),
     )
     quality = build_data_quality_report(
         auto.market,
         fixture_id=auto.fixture_id,
         team_rating_score=1.0 if auto.recent_form_available else 0.25,
         context_score=0.75 if auto.league_id and auto.season and auto.kickoff else 0.45,
-        lineup_score=0.0,
+        lineup_score=0.30 if auto.deep_stats_available else 0.0,
         min_quality=min_quality,
         max_score=_quality_cap_for_recent_form(auto.recent_form_available, min_quality),
     )
@@ -437,11 +584,20 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             "dataSource": f"API-Football 随机今日比赛 {date}",
             "snapshotId": snapshot_id,
             "requiredBookmaker": auto.market.required_bookmaker or "-",
+            "bookmakerPriority": auto.market.bookmaker_priority,
+            "selectedBookmakers": auto.market.selected_bookmakers,
             "bookmaker": auto.market.selected_bookmaker or "未取得",
             "oddsCapturedAt": auto.market.captured_at or "",
             "oddsCapturedAtBeijing": to_beijing_time(auto.market.captured_at or ""),
             "marketDatasetVersion": MARKET_DATASET_VERSION,
             "pbaseModelVersion": PBASE_MODEL_VERSION,
+            "collectionMode": auto.collection_mode,
+            "collectionModeZh": _collection_mode_zh(auto.collection_mode),
+            "deepStatsMatches": auto.deep_stats_matches,
+            "apiLogicalRequests": auto.api_logical_requests,
+            "apiHttpAttempts": auto.api_http_attempts,
+            "apiCacheHits": auto.api_cache_hits,
+            "apiCacheMisses": auto.api_cache_misses,
             "recentMatchesHome": auto.home_recent_matches,
             "recentMatchesAway": auto.away_recent_matches,
             "recentMatchesRequired": MIN_VALID_RECENT_MATCHES,
@@ -458,9 +614,114 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             auto.data_notes,
             quality,
             auto.governance,
+            auto.risk_context,
         ),
     }
     return result
+
+
+def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
+    date = str(payload.get("date") or _today_shanghai())
+    scope = str(payload.get("scope") or "first_division")
+    limit = max(1, min(env_int("WORLDCUP_WEB_BATCH_LIMIT", 5), _optional_int(payload.get("limit")) or 5))
+    requested_fixture_ids = _parse_fixture_ids(payload.get("fixtureIds") or payload.get("batchFixtureIds"))
+    bankroll = as_float(payload.get("bankroll"), 1000.0)
+    unit = _optional_float(payload.get("unit"))
+    market_weight = clamp(as_float(payload.get("marketWeight"), 0.45), 0.0, 0.95)
+    min_edge = clamp(as_float(payload.get("minEdge"), DEFAULT_MIN_EDGE), 0.0, 1.0)
+    collection_mode = str(payload.get("collectionMode") or "batch")
+    client = CachedApiFootballClient(api_key=_api_key_from_request(payload))
+    failed: list[dict[str, Any]] = []
+    if requested_fixture_ids:
+        fixtures = []
+        for fixture_id in requested_fixture_ids[:limit]:
+            try:
+                fixtures.append(client.fixture_by_id(fixture_id))
+            except ApiFootballError as exc:
+                failure = _classify_batch_failure(str(exc))
+                failed.append(
+                    {
+                        "fixtureId": fixture_id,
+                        "home": "主队",
+                        "away": "客队",
+                        "league": "-",
+                        "kickoffBeijing": "-",
+                        "failureType": failure["type"],
+                        "failureLabel": failure["label"],
+                        "error": str(exc),
+                    }
+                )
+    else:
+        fixtures = [
+            item
+            for item in client.fixtures_by_date(date)
+            if _fixture_has_two_teams(item)
+            and _is_pre_match_fixture(item)
+            and (
+                scope == "all"
+                or is_first_division_league(
+                    (item.get("league") or {}).get("name"),
+                    (item.get("league") or {}).get("country"),
+                )
+            )
+        ]
+        fixtures = sorted(fixtures, key=lambda item: str((item.get("fixture") or {}).get("date") or ""))[:limit]
+
+    collected: list[dict[str, Any]] = []
+    for row in fixtures:
+        fixture = row.get("fixture") or {}
+        teams = row.get("teams") or {}
+        league = row.get("league") or {}
+        fixture_id = _optional_int(fixture.get("id"))
+        home = str((teams.get("home") or {}).get("name") or "")
+        away = str((teams.get("away") or {}).get("name") or "")
+        try:
+            result = run_web_prediction(
+                {
+                    "mode": "auto",
+                    "home": home,
+                    "away": away,
+                    "fixtureId": fixture_id,
+                    "bankroll": bankroll,
+                    "unit": unit,
+                    "marketWeight": market_weight,
+                    "minEdge": min_edge,
+                    "collectionMode": collection_mode,
+                    "bookmakerPriority": payload.get("bookmakerPriority"),
+                },
+                client=client,
+            )
+            run_id = record_prediction(result)
+            result["runId"] = run_id
+            collected.append(_batch_collected_item(result, run_id, fixture_id, home, away, league, fixture, bankroll))
+        except (ApiFootballError, ValueError) as exc:
+            failed.append(_batch_failed_item(fixture_id, home, away, league, fixture, exc))
+
+    collected = sorted(collected, key=_batch_sort_key, reverse=True)
+
+    return {
+        "date": date,
+        "scope": scope,
+        "limit": limit,
+        "fixtureIds": requested_fixture_ids,
+        "candidateFixtures": len(fixtures),
+        "collectedCount": len(collected),
+        "failedCount": len(failed),
+        "batchSummary": _batch_summary(collected, failed, bankroll),
+        "collected": collected,
+        "failed": failed,
+        "apiRequests": {
+            "logical": client.logical_requests,
+            "httpAttempts": client.http_attempts,
+            "cacheHits": client.cache_hits,
+            "cacheMisses": client.cache_misses,
+        },
+        "message": (
+            f"指定比赛批量分析完成：成功 {len(collected)} 场，失败 {len(failed)} 场。"
+            if requested_fixture_ids
+            else f"{date} 批量分析完成：成功 {len(collected)} 场，失败 {len(failed)} 场。"
+        ),
+    }
 
 
 def search_api_fixtures(
@@ -655,6 +916,9 @@ def recent_prediction_options(limit: int = 12) -> list[dict[str, Any]]:
         payload = get_prediction_payload(int(item["id"])) or {}
         match = payload.get("match") or {}
         meta = payload.get("meta") or {}
+        portfolio = payload.get("portfolio") or {}
+        prediction = _history_prediction_summary(payload)
+        recommendation = _history_recommendation_summary(payload)
         options.append(
             {
                 **item,
@@ -662,9 +926,419 @@ def recent_prediction_options(limit: int = 12) -> list[dict[str, Any]]:
                 "awayZh": translate_team_display(match.get("away") or item.get("away_team"), "客队"),
                 "leagueZh": translate_league_display(meta.get("leagueName"), meta.get("leagueCountry")),
                 "kickoffBeijing": meta.get("kickoffBeijing") or to_beijing_time(meta.get("kickoff")),
+                "predictionLabel": prediction["label"],
+                "predictionProbability": prediction["probability"],
+                "recommendationSummary": recommendation["summary"],
+                "recommendationAction": recommendation["action"],
+                "signalStatus": recommendation["action"],
+                "bookmaker": meta.get("bookmaker") or "未取得",
+                "qualityLabel": ((payload.get("dataQuality") or {}).get("gradeLabel") or "-"),
+                "bankroll": portfolio.get("bankroll"),
+                "totalStake": portfolio.get("total_stake"),
+                "expectedBankroll": portfolio.get("expected_bankroll"),
+                "expectedProfit": portfolio.get("expected_profit"),
             }
         )
     return options
+
+
+def recent_batch_options(limit: int = 50) -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    for item in recent_batch_predictions(limit=limit):
+        title = str(item.get("title") or "").strip()
+        notes = str(item.get("notes") or "").strip()
+        fixture_ids = [
+            value for value in str(item.get("fixture_ids") or "").split(",")
+            if value.strip()
+        ]
+        fallback_label = f"批次 {item['id']} · 成功 {item.get('collected_count') or 0} 场 · 信号 {item.get('signal_count') or 0} 个"
+        batches.append(
+            {
+                **item,
+                "title": title,
+                "notes": notes,
+                "fixtureIds": fixture_ids,
+                "isOfficial": bool(item.get("is_official")),
+                "officialDate": item.get("official_date") or "",
+                "label": title or fallback_label,
+                "fallbackLabel": fallback_label,
+                "scopeZh": "甲级联赛" if item.get("scope") == "first_division" else str(item.get("scope") or "-"),
+            }
+        )
+    return batches
+
+
+def _history_prediction_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    match = payload.get("match") or {}
+    probabilities = payload.get("probabilities") or {}
+    display = probabilities.get("display") or probabilities.get("final") or {}
+    labels = {
+        "home_win": f"{translate_team_display(match.get('home'), '主队')} 胜",
+        "draw": "平局",
+        "away_win": f"{translate_team_display(match.get('away'), '客队')} 胜",
+    }
+    candidates = [
+        (key, float(display.get(key) or 0.0))
+        for key in ("home_win", "draw", "away_win")
+    ]
+    key, probability = max(candidates, key=lambda item: item[1])
+    return {"label": labels[key], "probability": probability}
+
+
+def _history_recommendation_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    match = payload.get("match") or {}
+    recommendations = payload.get("recommendations") or []
+    active = [
+        item for item in recommendations
+        if isinstance(item, dict) and item.get("signal_status") == "PAPER_BUY"
+    ]
+    if active:
+        item = active[0]
+        selection = localize_selection(str(item.get("selection") or ""), str(match.get("home") or ""), str(match.get("away") or ""))
+        return {"action": "PAPER_BUY", "summary": f"{item.get('market') or '-'}：{selection}"}
+    suspended = [
+        item for item in recommendations
+        if isinstance(item, dict) and item.get("signal_status") == "SUSPENDED"
+    ]
+    if suspended:
+        item = suspended[0]
+        selection = localize_selection(str(item.get("selection") or ""), str(match.get("home") or ""), str(match.get("away") or ""))
+        return {"action": "SUSPENDED", "summary": f"暂停：{item.get('market') or '-'} {selection}".strip()}
+    model_candidates = [
+        item for item in recommendations
+        if isinstance(item, dict) and item.get("signal_status") == "MODEL_CANDIDATE"
+    ]
+    if model_candidates:
+        item = model_candidates[0]
+        selection = localize_selection(str(item.get("selection") or ""), str(match.get("home") or ""), str(match.get("away") or ""))
+        return {"action": "MODEL_CANDIDATE", "summary": f"模型候选：{item.get('market') or '-'} {selection}".strip()}
+    watch = [
+        item for item in recommendations
+        if isinstance(item, dict) and (item.get("signal_status") == "RESEARCH_WATCH" or item.get("action") == "WATCH")
+    ]
+    if watch:
+        item = watch[0]
+        selection = localize_selection(str(item.get("selection") or ""), str(match.get("home") or ""), str(match.get("away") or ""))
+        return {"action": "RESEARCH_WATCH", "summary": f"研究观察：{item.get('market') or '-'} {selection}".strip()}
+    no_market = [
+        item for item in recommendations
+        if isinstance(item, dict) and item.get("action") == "NO_MARKET"
+    ]
+    if no_market:
+        return {"action": "NO_MARKET", "summary": "市场缺失"}
+    return {"action": "-", "summary": "暂无方向"}
+
+
+def _batch_collected_item(
+    result: dict[str, Any],
+    run_id: int,
+    fixture_id: int | None,
+    home: str,
+    away: str,
+    league: dict[str, Any],
+    fixture: dict[str, Any],
+    bankroll: float,
+) -> dict[str, Any]:
+    match = result.get("match") or {}
+    meta = result.get("meta") or {}
+    portfolio = result.get("portfolio") or {}
+    quality = result.get("dataQuality") or {}
+    prediction = _history_prediction_summary(result)
+    recommendation = _batch_recommendation_summary(result)
+    governance = result.get("modelGovernance") or {}
+    market = result.get("market") or {}
+    quality_score = _optional_float(quality.get("score"))
+    markets = quality.get("markets") or []
+    available_markets = sum(1 for item in markets if isinstance(item, dict) and item.get("status") == "available")
+    return {
+        "runId": run_id,
+        "fixtureId": fixture_id,
+        "home": match.get("homeZh") or translate_team_display(home, "主队"),
+        "away": match.get("awayZh") or translate_team_display(away, "客队"),
+        "league": meta.get("leagueNameZh") or translate_league_display(league.get("name"), league.get("country")),
+        "kickoffBeijing": meta.get("kickoffBeijing") or to_beijing_time(fixture.get("date")),
+        "bookmaker": meta.get("bookmaker") or "未取得",
+        "selectedBookmakers": (market.get("selectedBookmakers") or meta.get("selectedBookmakers") or {}),
+        "predictionLabel": prediction["label"],
+        "predictionProbability": prediction["probability"],
+        "recommendationAction": recommendation["action"],
+        "recommendationSummary": recommendation["summary"],
+        "recommendationMarket": recommendation["market"],
+        "recommendationSelection": recommendation["selection"],
+        "recommendationReason": recommendation["reason"],
+        "odds": recommendation["odds"],
+        "modelProbability": recommendation["modelProbability"],
+        "modelProbabilityLabel": recommendation.get("modelProbabilityLabel") or "",
+        "marketProbability": recommendation["marketProbability"],
+        "expectedValue": recommendation["expectedValue"],
+        "conservativeExpectedValue": recommendation["conservativeExpectedValue"],
+        "evStatus": recommendation["evStatus"],
+        "signalStatus": recommendation.get("signalStatus") or recommendation["action"],
+        "evLayer": recommendation.get("evLayer") or "",
+        "evPbaseResearch": recommendation.get("evPbaseResearch"),
+        "evPfinalExec": recommendation.get("evPfinalExec"),
+        "qualityScore": quality_score,
+        "qualityLabel": quality.get("gradeLabel") or "-",
+        "availableMarkets": available_markets,
+        "totalMarkets": len(markets),
+        "gateLabel": governance.get("gateLabel") or "",
+        "activeBets": int(portfolio.get("active_bets") or 0),
+        "unitStake": _optional_float(portfolio.get("unit_stake")),
+        "totalStake": _optional_float(portfolio.get("total_stake")) or 0.0,
+        "expectedProfit": _optional_float(portfolio.get("expected_profit")) or 0.0,
+        "expectedBankroll": _optional_float(portfolio.get("expected_bankroll")) or bankroll,
+    }
+
+
+def _batch_recommendation_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    match = payload.get("match") or {}
+    recommendations = [
+        item for item in (payload.get("recommendations") or [])
+        if isinstance(item, dict)
+    ]
+    if not recommendations:
+        return _empty_batch_recommendation("暂无方向", "-")
+    priority = {
+        "PAPER_BUY": 5,
+        "MODEL_CANDIDATE": 4,
+        "SUSPENDED": 3,
+        "RESEARCH_WATCH": 2,
+        "NO_MARKET": 1,
+        "BUY": 4,
+        "WATCH": 2,
+    }
+
+    def score(item: dict[str, Any]) -> tuple[float, float, float, float]:
+        conservative_ev = _optional_float(
+            item.get("conservative_ev_pbase_research")
+            if item.get("conservative_ev_pbase_research") is not None
+            else item.get("conservative_expected_value_per_unit")
+        )
+        ev = _optional_float(
+            item.get("ev_pbase_research")
+            if item.get("ev_pbase_research") is not None
+            else item.get("expected_value_per_unit")
+        )
+        model_probability = _optional_float(item.get("model_probability"))
+        signal_status = str(item.get("signal_status") or item.get("action") or "")
+        return (
+            priority.get(signal_status, 0),
+            conservative_ev if conservative_ev is not None else -99.0,
+            ev if ev is not None else -99.0,
+            model_probability if model_probability is not None else 0.0,
+        )
+
+    item = max(recommendations, key=score)
+    action = str(item.get("signal_status") or item.get("action") or "-")
+    market = str(item.get("market") or "-")
+    selection = localize_selection(str(item.get("selection") or ""), str(match.get("home") or ""), str(match.get("away") or ""))
+    if action == "NO_MARKET":
+        summary = "市场缺失"
+    elif action == "SUSPENDED":
+        summary = f"暂停：{market} {selection}".strip()
+    elif action in {"WATCH", "RESEARCH_WATCH"}:
+        summary = f"研究观察：{market} {selection}".strip()
+    elif action == "MODEL_CANDIDATE":
+        summary = f"模型候选：{market} {selection}".strip()
+    else:
+        summary = f"{market}：{selection}"
+    expected_value = _optional_float(
+        item.get("ev_pbase_research")
+        if item.get("ev_pbase_research") is not None
+        else item.get("expected_value_per_unit")
+    )
+    conservative_value = _optional_float(
+        item.get("conservative_ev_pbase_research")
+        if item.get("conservative_ev_pbase_research") is not None
+        else item.get("conservative_expected_value_per_unit")
+    )
+    return {
+        "action": action,
+        "summary": summary,
+        "market": market,
+        "selection": selection,
+        "reason": str(item.get("reason") or ""),
+        "odds": _optional_float(item.get("odds")),
+        "modelProbability": _optional_float(item.get("model_probability")),
+        "modelProbabilityLabel": str(item.get("model_probability_label") or ""),
+        "marketProbability": _optional_float(item.get("market_probability")),
+        "expectedValue": expected_value,
+        "conservativeExpectedValue": conservative_value,
+        "evStatus": str(item.get("ev_status") or ""),
+        "signalStatus": action,
+        "evLayer": str(item.get("ev_layer") or ""),
+        "evPbaseResearch": _optional_float(item.get("ev_pbase_research")),
+        "evPfinalExec": _optional_float(item.get("ev_pfinal_exec")),
+    }
+
+
+def _empty_batch_recommendation(summary: str, action: str) -> dict[str, Any]:
+    return {
+        "action": action,
+        "summary": summary,
+        "market": "-",
+        "selection": "-",
+        "reason": "",
+        "odds": None,
+        "modelProbability": None,
+        "modelProbabilityLabel": "",
+        "marketProbability": None,
+        "expectedValue": None,
+        "conservativeExpectedValue": None,
+        "evStatus": "",
+        "signalStatus": action,
+        "evLayer": "",
+        "evPbaseResearch": None,
+        "evPfinalExec": None,
+    }
+
+
+def _batch_failed_item(
+    fixture_id: int | None,
+    home: str,
+    away: str,
+    league: dict[str, Any],
+    fixture: dict[str, Any],
+    exc: Exception,
+) -> dict[str, Any]:
+    failure = _classify_batch_failure(str(exc))
+    return {
+        "fixtureId": fixture_id,
+        "home": translate_team_display(home, "主队"),
+        "away": translate_team_display(away, "客队"),
+        "league": translate_league_display(league.get("name"), league.get("country")),
+        "kickoffBeijing": to_beijing_time(fixture.get("date")),
+        "failureType": failure["type"],
+        "failureLabel": failure["label"],
+        "error": str(exc),
+    }
+
+
+def _classify_batch_failure(message: str) -> dict[str, str]:
+    text = message.casefold()
+    if any(keyword in text for keyword in ["已开赛", "完赛", "赛前", "kickoff", "started", "finished"]):
+        return {"type": "NOT_PRE_MATCH", "label": "非赛前比赛"}
+    if any(keyword in text for keyword in ["fixture", "id", "not found", "找不到", "无效"]):
+        return {"type": "INVALID_FIXTURE", "label": "比赛 ID/赛程无效"}
+    if any(keyword in text for keyword in ["赔率", "欧赔", "盘口", "odds", "market"]):
+        return {"type": "NO_MARKET", "label": "盘口缺失"}
+    if any(keyword in text for keyword in ["样本", "近期", "recent"]):
+        return {"type": "INSUFFICIENT_SAMPLE", "label": "样本不足"}
+    if any(keyword in text for keyword in ["api-football", "ssl", "timeout", "request", "连接"]):
+        return {"type": "API_ERROR", "label": "API/网络异常"}
+    return {"type": "PREDICTION_ERROR", "label": "分析失败"}
+
+
+def _batch_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    action_priority = {
+        "PAPER_BUY": 5.0,
+        "MODEL_CANDIDATE": 4.0,
+        "SUSPENDED": 3.0,
+        "RESEARCH_WATCH": 2.0,
+        "BUY": 4.0,
+        "WATCH": 2.0,
+        "NO_MARKET": 1.0,
+    }.get(
+        str(item.get("signalStatus") or item.get("recommendationAction") or ""),
+        0.0,
+    )
+    quality_score = _optional_float(item.get("qualityScore")) or 0.0
+    conservative_ev = _optional_float(item.get("conservativeExpectedValue"))
+    expected_ev = _optional_float(item.get("expectedValue"))
+    prediction_probability = _optional_float(item.get("predictionProbability")) or 0.0
+    return (
+        action_priority,
+        quality_score,
+        conservative_ev if conservative_ev is not None else -99.0,
+        expected_ev if expected_ev is not None else -99.0,
+        prediction_probability,
+    )
+
+
+def _batch_summary(collected: list[dict[str, Any]], failed: list[dict[str, Any]], bankroll: float) -> dict[str, Any]:
+    active = [item for item in collected if _is_batch_paper_buy(item)]
+    watch = [item for item in collected if item.get("signalStatus") in {"RESEARCH_WATCH", "MODEL_CANDIDATE"}]
+    no_market = [item for item in collected if item.get("signalStatus") == "NO_MARKET" or item.get("recommendationAction") == "NO_MARKET"]
+    total_stake = sum(_optional_float(item.get("totalStake")) or 0.0 for item in collected)
+    expected_profit = sum(_optional_float(item.get("expectedProfit")) or 0.0 for item in collected)
+    high_quality = sum(1 for item in collected if (_optional_float(item.get("qualityScore")) or 0.0) >= 0.75)
+    return {
+        "total": len(collected) + len(failed),
+        "success": len(collected),
+        "failed": len(failed),
+        "signalCount": len(active),
+        "watchCount": len(watch),
+        "noMarketCount": len(no_market),
+        "highQualityCount": high_quality,
+        "totalStake": total_stake,
+        "expectedProfit": expected_profit,
+        "expectedBankroll": bankroll + expected_profit,
+        "bankrollMode": "批量内逐场独立评估，暂未按同批顺序扣减资金。",
+        "portfolioPlan": _batch_portfolio_plan(collected, bankroll),
+    }
+
+
+def _batch_portfolio_plan(collected: list[dict[str, Any]], bankroll: float) -> dict[str, Any]:
+    candidates = [
+        item for item in collected
+        if _is_batch_paper_buy(item)
+        and (_optional_float(item.get("totalStake")) or 0.0) > 0
+    ]
+    stake_cap = max(0.0, bankroll * 0.5)
+    used_stake = 0.0
+    selected: list[dict[str, Any]] = []
+    for item in sorted(candidates, key=_batch_sort_key, reverse=True):
+        stake = _optional_float(item.get("totalStake")) or 0.0
+        if stake_cap and used_stake + stake > stake_cap:
+            continue
+        used_stake += stake
+        selected.append(item)
+
+    expected_profit = sum(_optional_float(item.get("expectedProfit")) or 0.0 for item in selected)
+    league_counts: dict[str, int] = {}
+    market_counts: dict[str, int] = {}
+    for item in selected:
+        league = str(item.get("league") or "未知联赛")
+        market = str(item.get("recommendationMarket") or "未知市场")
+        league_counts[league] = league_counts.get(league, 0) + 1
+        market_counts[market] = market_counts.get(market, 0) + 1
+
+    warnings: list[str] = []
+    if len(candidates) != len(selected):
+        warnings.append(f"候选 {len(candidates)} 场中仅纳入 {len(selected)} 场，避免单批资金占用超过 50%。")
+    crowded_leagues = [league for league, count in league_counts.items() if count >= 3]
+    if crowded_leagues:
+        league = crowded_leagues[0]
+        warnings.append(f"同一联赛集中：{league} 达到 {league_counts[league]} 场，后续应降权。")
+    crowded_markets = [market for market, count in market_counts.items() if count >= 3]
+    if crowded_markets:
+        market = crowded_markets[0]
+        warnings.append(f"同一市场集中：{market} 达到 {market_counts[market]} 场，后续应控制暴露。")
+    if not selected:
+        warnings.append("本批次暂无通过研究信号和资金占用条件的组合候选。")
+
+    return {
+        "mode": "研究组合预案",
+        "policy": "候选按推荐优先、质量、纸上 EV 排序；正式 EV 未开放时不产生资金占用。",
+        "candidateCount": len(candidates),
+        "selectedCount": len(selected),
+        "stakeCap": stake_cap,
+        "plannedStake": used_stake,
+        "remainingStakeCap": max(0.0, stake_cap - used_stake),
+        "expectedProfit": expected_profit,
+        "expectedBankroll": bankroll + expected_profit,
+        "selectedRunIds": [item.get("runId") for item in selected],
+        "leagueExposure": league_counts,
+        "marketExposure": market_counts,
+        "warnings": warnings,
+    }
+
+
+def _is_batch_paper_buy(item: dict[str, Any]) -> bool:
+    signal = str(item.get("signalStatus") or "")
+    if signal:
+        return signal == "PAPER_BUY"
+    return str(item.get("recommendationAction") or "") in {"BUY", "PAPER_BUY"}
 
 
 def api_status_payload(api_key: str | None = None) -> dict[str, Any]:
@@ -816,15 +1490,25 @@ def _record_auto_snapshot(auto, source: str) -> int:
 
 def _data_processing_payload(auto) -> dict[str, Any]:
     recent_form = (auto.raw_snapshot or {}).get("recent_form") or {}
+    risk_context = auto.risk_context or {}
     home = _form_series_payload(auto.result.home_team, "主队", recent_form.get("home") or [])
     away = _form_series_payload(auto.result.away_team, "客队", recent_form.get("away") or [])
     fixture_label = translate_league_display(auto.league_name, auto.league_country)
     odds_status = (
-        f"已取得 {auto.market.selected_bookmaker} 全场盘口"
+        f"已按优先级取得全场盘口：{_bookmaker_source_summary(auto.market)}"
         if auto.market.selected_bookmaker
-        else "未取得指定庄家全场盘口"
+        else "未取得庄家优先级内可用全场盘口"
     )
     return {
+        "collectionMode": auto.collection_mode,
+        "collectionModeZh": _collection_mode_zh(auto.collection_mode),
+        "deepStatsMatches": auto.deep_stats_matches,
+        "apiRequests": {
+            "logical": auto.api_logical_requests,
+            "httpAttempts": auto.api_http_attempts,
+            "cacheHits": auto.api_cache_hits,
+            "cacheMisses": auto.api_cache_misses,
+        },
         "requestedMatches": RECENT_MATCH_FETCH_COUNT,
         "requiredMatches": MIN_VALID_RECENT_MATCHES,
         "coverageReady": auto.recent_form_available,
@@ -850,14 +1534,31 @@ def _data_processing_payload(auto) -> dict[str, Any]:
                 "detail": "按 90 分钟赛果计算场均进球、场均失球、场均积分及攻防评分。",
             },
             {
+                "label": "补充深度统计",
+                "status": "完成" if auto.deep_stats_matches else ("跳过" if auto.collection_mode == "fast" else "缺失"),
+                "detail": (
+                    f"{_collection_mode_zh(auto.collection_mode)}；技术统计/事件覆盖 "
+                    f"{auto.deep_stats_matches} 场，逻辑请求 {auto.api_logical_requests} 次，"
+                    f"实际 HTTP {auto.api_http_attempts} 次，缓存命中 {auto.api_cache_hits} 次。"
+                ),
+            },
+            {
                 "label": "抓取盘口",
                 "status": "完成" if auto.market.selected_bookmaker else "缺失",
                 "detail": odds_status,
             },
             {
-                "label": "模型与风险闸门",
+                "label": "风险识别与 λ 收缩",
                 "status": "已执行",
-                "detail": "生成独立模型概率并检查盘口分歧、质量门槛与正式 EV 准入状态。",
+                "detail": (
+                    f"λ shrink factor {float(risk_context.get('lambdaShrinkFactor') or 1.0):.2f}；"
+                    + "、".join(str(item) for item in risk_context.get("lambdaShrinkReasons") or ["无额外风险"])
+                ),
+            },
+            {
+                "label": "模型与 EV 闸门",
+                "status": "已执行",
+                "detail": "生成 pbase、对照 qmkt、计算 p_adj / paper_EV，并检查盘口分歧、质量门槛与 formal_EV 准入状态。",
             },
         ],
         "oddsTrend": {
@@ -869,8 +1570,19 @@ def _data_processing_payload(auto) -> dict[str, Any]:
             "away": auto.result.away_team,
             "league": auto.league_name,
             "leagueCountry": auto.league_country,
+            "riskContext": risk_context,
         },
     }
+
+
+def _bookmaker_source_summary(market: MarketSnapshot) -> str:
+    if market.selected_bookmakers:
+        labels = {"1X2": "胜平负", "OU": "大小球", "AH": "让球"}
+        return "，".join(
+            f"{labels.get(key, key)}={value}"
+            for key, value in market.selected_bookmakers.items()
+        )
+    return market.selected_bookmaker or "未取得"
 
 
 def _form_series_payload(team_name: str, role_label: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -882,6 +1594,13 @@ def _form_series_payload(team_name: str, role_label: str, rows: list[dict[str, A
     ppg = points / count if count else 0.0
     gf_avg = goals_for / count if count else 0.0
     ga_avg = goals_against / count if count else 0.0
+    xg_avg = _average_optional(chronological, "xg")
+    shots_avg = _average_optional(chronological, "shots")
+    shots_on_target_avg = _average_optional(chronological, "shots_on_target")
+    possession_avg = _average_optional(chronological, "possession_pct")
+    red_cards = sum(int(item.get("red_cards") or 0) for item in chronological)
+    penalties = sum(int(item.get("penalties") or 0) for item in chronological)
+    technical_count = sum(1 for item in chronological if item.get("technical_available"))
     attack_rating = clamp(0.55 + gf_avg / 1.8, 0.65, 1.6) if count else 1.0
     defense_rating = clamp(1.55 - ga_avg / 2.2, 0.65, 1.55) if count else 1.0
     estimated_elo = 1450.0 + ppg * 110.0 if count else 1500.0
@@ -905,6 +1624,13 @@ def _form_series_payload(team_name: str, role_label: str, rows: list[dict[str, A
                 "venueLabel": "主场" if item.get("venue") == "home" else "客场",
                 "goalsFor": goals_for_row,
                 "goalsAgainst": goals_against_row,
+                "xg": item.get("xg"),
+                "shots": item.get("shots"),
+                "shotsOnTarget": item.get("shots_on_target"),
+                "possessionPct": item.get("possession_pct"),
+                "redCards": item.get("red_cards"),
+                "penalties": item.get("penalties"),
+                "technicalAvailable": bool(item.get("technical_available")),
                 "points": row_points,
                 "cumulativePoints": cumulative,
                 "resultLabel": result,
@@ -919,11 +1645,39 @@ def _form_series_payload(team_name: str, role_label: str, rows: list[dict[str, A
         "pointsPerGame": ppg,
         "goalsForAverage": gf_avg,
         "goalsAgainstAverage": ga_avg,
+        "xgAverage": xg_avg,
+        "shotsAverage": shots_avg,
+        "shotsOnTargetAverage": shots_on_target_avg,
+        "possessionAverage": possession_avg,
+        "redCards": red_cards,
+        "penalties": penalties,
+        "technicalCount": technical_count,
         "attackRating": attack_rating,
         "defenseRating": defense_rating,
         "estimatedElo": estimated_elo,
         "matches": matches,
     }
+
+
+def _average_optional(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = []
+    for row in rows:
+        value = row.get(key)
+        if value in {None, ""}:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return sum(values) / len(values) if values else None
+
+
+def _collection_mode_zh(value: str) -> str:
+    return {
+        "fast": "快速模式",
+        "deep": "深度模式",
+        "batch": "批量建库模式",
+    }.get(str(value or ""), "深度模式")
 
 
 def _prediction_payload(
@@ -934,6 +1688,7 @@ def _prediction_payload(
     notes: list[str],
     data_quality,
     governance,
+    risk_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     home_zh = translate_team_display(result.home_team, "主队")
     away_zh = translate_team_display(result.away_team, "客队")
@@ -956,11 +1711,21 @@ def _prediction_payload(
             "market": result.market_probabilities,
         },
         "modelGovernance": governance.to_dict(),
+        "liveReadiness": build_live_readiness_status(),
         "modelAudit": model_audit,
         "expectedGoals": {
             "home": result.expected_goals_home,
             "away": result.expected_goals_away,
+            "rawHome": result.raw_expected_goals_home,
+            "rawAway": result.raw_expected_goals_away,
+            "lambdaShrinkFactor": result.lambda_shrink_factor,
+            "lambdaShrinkReasons": list(result.lambda_shrink_reasons or []),
+            "scoreMatrixMaxGoals": result.score_matrix_max_goals,
+            "scoreMatrixProbabilitySum": result.score_matrix_probability_sum,
+            "scoreMatrixTailMass": result.score_matrix_tail_mass,
+            "lambdaRiskFlags": list(result.lambda_risk_flags or []),
         },
+        "riskContext": risk_context or {},
         "topScores": [{"score": score, "probability": probability} for score, probability in result.top_scores],
         "featureEdges": result.feature_edges,
         "market": _market_payload(market),
@@ -969,6 +1734,10 @@ def _prediction_payload(
             {
                 **asdict(item),
                 "selection": localize_selection(item.selection, result.home_team, result.away_team),
+                "publicAction": _public_action(item),
+                "publicActionLabel": _public_action_label(item),
+                "formalExecutionEnabled": item.ev_pfinal_exec is not None,
+                "stakeStatusLabel": "资金占用已关闭" if item.stake <= 0 else "纸上资金占用",
             }
             for item in recommendations
         ],
@@ -977,13 +1746,39 @@ def _prediction_payload(
     }
 
 
+def _public_action(item) -> str:
+    signal = str(getattr(item, "signal_status", "") or getattr(item, "action", "") or "")
+    if signal == "PAPER_BUY":
+        return "PAPER_OBSERVATION"
+    if signal in {"SUSPENDED", "MODEL_MARKET_CONFLICT"}:
+        return "SUSPENDED"
+    if signal == "NO_MARKET" or getattr(item, "action", "") == "NO_MARKET":
+        return "NO_MARKET"
+    if signal in {"MODEL_CANDIDATE", "BUY"}:
+        return "MODEL_CANDIDATE"
+    return "RESEARCH_OBSERVATION"
+
+
+def _public_action_label(item) -> str:
+    return {
+        "PAPER_OBSERVATION": "纸上观察",
+        "SUSPENDED": "暂停复核",
+        "NO_MARKET": "市场缺失",
+        "MODEL_CANDIDATE": "模型候选（未执行）",
+        "RESEARCH_OBSERVATION": "研究观察",
+    }[_public_action(item)]
+
+
 def _market_payload(market: MarketSnapshot) -> dict[str, Any]:
     total_line = market.best_total_line()
     handicap_line = market.best_handicap_line()
     return {
         "bookmakersCount": market.bookmakers_count,
+        "availableBookmakersCount": market.available_bookmakers_count,
         "requiredBookmaker": market.required_bookmaker,
+        "bookmakerPriority": market.bookmaker_priority,
         "selectedBookmaker": market.selected_bookmaker,
+        "selectedBookmakers": market.selected_bookmakers,
         "capturedAt": market.captured_at,
         "matchWinnerOdds": market.match_winner,
         "totalLine": {"line": total_line[0], "odds": total_line[1]} if total_line else None,
@@ -1017,8 +1812,11 @@ def _sample_market_snapshot(fixture) -> MarketSnapshot:
     return MarketSnapshot(
         fixture_id=None,
         bookmakers_count=1,
+        available_bookmakers_count=1,
         required_bookmaker="本地示例",
+        bookmaker_priority=["本地示例"],
         selected_bookmaker="本地示例",
+        selected_bookmakers={"1X2": "本地示例", "OU": "本地示例", "AH": "本地示例"},
         match_winner={
             "home_win": fixture.odds_home,
             "draw": fixture.odds_draw,
@@ -1043,6 +1841,26 @@ def _optional_float(value: Any) -> float | None:
     if value in {None, ""}:
         return None
     return as_float(value)
+
+
+def _parse_fixture_ids(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        if str(value).strip() == "":
+            return []
+        raw_items = str(value).replace("，", ",").replace("\n", ",").replace(" ", ",").split(",")
+    fixture_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_items:
+        fixture_id = _optional_int(raw)
+        if fixture_id is None or fixture_id in seen:
+            continue
+        seen.add(fixture_id)
+        fixture_ids.append(fixture_id)
+    return fixture_ids
 
 
 def _optional_int(value: Any) -> int | None:

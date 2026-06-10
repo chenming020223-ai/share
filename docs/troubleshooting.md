@@ -1,6 +1,6 @@
 # 故障排查
 
-日期：2026-05-22
+日期：2026-06-03
 
 ## API-Football SSL 证书错误
 
@@ -12,11 +12,16 @@ API-Football request failed: [SSL: CERTIFICATE_VERIFY_FAILED]
 
 原因通常是 macOS 上 Python 的本地证书链不完整。
 
-项目已在 API 客户端中优先使用 `certifi` 证书包。更新代码后需要重启本地网页服务：
+项目已在 API 客户端中优先使用 `certifi` 证书包。更新代码后需要重启本地网页服务。日常使用建议先双击：
 
-```bash
-Control + C
-python3 -m worldcup_predictor.web_server
+```text
+stop_worldcup_predictor.command
+```
+
+再双击：
+
+```text
+start_worldcup_predictor.command
 ```
 
 如果重启后仍然报证书错误，运行：
@@ -60,7 +65,7 @@ API_FOOTBALL_RETRIES=3
 - 关闭或切换 VPN / 代理。
 - 换一个网络环境。
 - 打开 `http://127.0.0.1:8765/api/api-status` 检查 API 连接状态。
-- 优先用“示例”模式确认本地模型、报告导出、数据库都正常。
+- 如果网页能打开但 API 失败，可先查看“历史报告”确认本地数据库和报告导出是否正常。
 
 ## API 模式找不到比赛
 
@@ -68,11 +73,13 @@ API_FOOTBALL_RETRIES=3
 
 ## 本地网页打不开
 
-优先双击：
+优先双击项目根目录中的启动脚本：
 
 ```text
 start_worldcup_predictor.command
 ```
+
+新版启动脚本会把网页服务放到后台运行。启动成功后，即使关闭弹出的终端窗口，`http://127.0.0.1:8765` 也应继续可用。
 
 如果提示缺少组件，先双击：
 
@@ -80,13 +87,44 @@ start_worldcup_predictor.command
 setup_worldcup_predictor.command
 ```
 
-确认服务仍在运行：
+如果想确认服务是否正常，打开健康检查：
+
+```text
+http://127.0.0.1:8765/healthz
+```
+
+返回 `ok: true` 表示本地服务还活着。
+
+停止本地服务：
+
+```text
+stop_worldcup_predictor.command
+```
+
+如果仍然打不开，可以在项目目录运行下面的检查命令：
+
+```bash
+screen -ls
+curl http://127.0.0.1:8765/healthz
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+tail -80 storage/web_server.err.log
+```
+
+常见原因：
+
+- 没有双击启动脚本，后台服务根本没有运行。
+- 旧版前台服务随着终端窗口关闭而停止。
+- 端口 `8765` 被其他程序占用。
+- Python 组件缺失，需要先运行安装脚本。
+- API-Football 网络或密钥异常，这种情况网页通常能打开，但预测会失败。
+
+开发调试时才建议手动启动前台服务：
 
 ```bash
 python3 -m worldcup_predictor.web_server
 ```
 
-打开：
+然后打开：
 
 ```text
 http://127.0.0.1:8765

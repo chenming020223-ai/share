@@ -56,6 +56,8 @@ class ApiFootballClient:
         self.timeout = timeout
         self.retries = max(0, retries if retries is not None else env_int("API_FOOTBALL_RETRIES", 3))
         self.ssl_context = _build_ssl_context()
+        self.logical_requests = 0
+        self.http_attempts = 0
         if not self.api_key:
             raise ApiFootballError(
                 "缺少 API-Football 密钥。请在页面填写 API Key，或在本地 .env 设置 API_FOOTBALL_KEY。",
@@ -63,6 +65,7 @@ class ApiFootballClient:
             )
 
     def get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.logical_requests += 1
         query = urllib.parse.urlencode(
             {key: value for key, value in (params or {}).items() if value is not None}
         )
@@ -90,6 +93,7 @@ class ApiFootballClient:
         last_error: BaseException | None = None
         attempts = self.retries + 1
         for attempt in range(1, attempts + 1):
+            self.http_attempts += 1
             request = urllib.request.Request(
                 url,
                 headers={
@@ -196,6 +200,18 @@ class ApiFootballClient:
         data = self.get("teams/statistics", {"league": league_id, "season": season, "team": team_id})
         response = data.get("response")
         return response if isinstance(response, dict) else None
+
+    def fixture_statistics(self, fixture_id: int) -> list[dict[str, Any]]:
+        data = self.get("fixtures/statistics", {"fixture": fixture_id})
+        return list(data.get("response", []))
+
+    def fixture_events(self, fixture_id: int) -> list[dict[str, Any]]:
+        data = self.get("fixtures/events", {"fixture": fixture_id})
+        return list(data.get("response", []))
+
+    def fixture_lineups(self, fixture_id: int) -> list[dict[str, Any]]:
+        data = self.get("fixtures/lineups", {"fixture": fixture_id})
+        return list(data.get("response", []))
 
     def injuries(self, fixture_id: int) -> list[dict[str, Any]]:
         data = self.get("injuries", {"fixture": fixture_id})

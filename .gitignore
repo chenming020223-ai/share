@@ -2,6 +2,13 @@
 __pycache__/
 *.py[cod]
 .env
+storage/*.sqlite
+storage/*.sqlite-*
 storage/*.sqlite3
 storage/*.sqlite3-*
+storage/*.log
+storage/*.pid
+storage/*.png
+storage/api_cache/
 artifacts/
+outputs/

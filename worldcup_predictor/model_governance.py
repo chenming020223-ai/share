@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 
-from .betting import BetRecommendation, PaperPortfolio
+from .betting import (
+    EV_LAYER_PBASE_RESEARCH,
+    SIGNAL_STATUS_RESEARCH_WATCH,
+    BetRecommendation,
+    PaperPortfolio,
+    recalculate_portfolio,
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,9 @@ def apply_formal_ev_gate(
                 item,
                 action="WATCH",
                 stake=0.0,
+                signal_status=SIGNAL_STATUS_RESEARCH_WATCH,
+                ev_layer=EV_LAYER_PBASE_RESEARCH,
+                ev_pfinal_exec=None,
                 reason=(
                     f"{item.reason} 当前仅形成研究试算 EV，pshr/pfinal 尚未通过时间切分校准与回测验证；"
                     "正式模拟信号未启用，降级为待校准复核。"
@@ -88,19 +97,4 @@ def apply_formal_ev_gate(
             )
         )
 
-    active = [item for item in adjusted if item.action in {"BUY", "PAPER_BUY"}]
-    total_stake = portfolio.unit_stake * len(active)
-    expected_profit = sum(
-        portfolio.unit_stake * (item.expected_value_per_unit or 0.0)
-        for item in active
-        if item.expected_value_per_unit is not None
-    )
-    return adjusted, PaperPortfolio(
-        bankroll=portfolio.bankroll,
-        unit_stake=portfolio.unit_stake,
-        active_bets=len(active),
-        total_stake=total_stake,
-        bankroll_after_stakes=portfolio.bankroll - total_stake,
-        expected_profit=expected_profit,
-        expected_bankroll=portfolio.bankroll + expected_profit,
-    )
+    return adjusted, recalculate_portfolio(portfolio, adjusted)

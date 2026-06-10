@@ -14,7 +14,7 @@ from .localization import (
 )
 
 MODEL_DIVERGENCE_LIMIT = 0.15
-SUSPENDED_EV_STATUS = "SUSPENDED_MODEL_DIVERGENCE"
+SUSPENDED_EV_STATUSES = {"SUSPENDED_MODEL_DIVERGENCE", "MODEL_MARKET_CONFLICT", "SUSPENDED"}
 
 
 def build_chinese_report(payload: dict[str, Any]) -> str:
@@ -40,7 +40,7 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
     away = _localized_team(match, "away", "球队B")
     league = _localized_league(meta)
     kickoff = str(meta.get("kickoffBeijing") or meta.get("kickoff") or "-")
-    required_bookmaker, received_bookmaker = _bookmaker_labels(payload)
+    bookmaker_priority, received_bookmaker = _bookmaker_labels(payload)
     generated_at = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S 北京时间")
 
     lines = [
@@ -54,9 +54,11 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
         f"- 赛事名称：{league}",
         f"- 开赛时间：{kickoff}",
         f"- 场地：{meta.get('venue') or '-'}",
-        f"- 指定庄家：{required_bookmaker}",
-        f"- 已取得盘口庄家：{received_bookmaker}",
+        f"- 庄家优先级：{bookmaker_priority}",
+        f"- 实际盘口庄家：{received_bookmaker}",
         f"- 赔率抓取时间：{meta.get('oddsCapturedAtBeijing') or meta.get('oddsCapturedAt') or '-'}",
+        f"- 数据抓取模式：{meta.get('collectionModeZh') or (processing.get('collectionModeZh') if processing else '-')}",
+        f"- 技术统计覆盖：{meta.get('deepStatsMatches') if meta.get('deepStatsMatches') is not None else (processing.get('deepStatsMatches') if processing else '-')} 场",
         f"- 近期有效比赛：{home} {meta.get('recentMatchesHome', '-')} 场 / {away} {meta.get('recentMatchesAway', '-')} 场",
         f"- 运行编号：{payload.get('runId') or '-'}",
         f"- 正式 EV 状态：{governance.get('gateLabel') or governance.get('gate_label') or '-'}",
@@ -120,15 +122,17 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
                 "",
                 "### 三附、数据处理审计",
                 "",
-                "| 球队 | 有效场数 | 场均积分 | 场均进球 | 场均失球 | 进攻评分 | 防守评分 |",
-                "|---|---:|---:|---:|---:|---:|---:|",
+                "| 球队 | 有效场数 | 技术覆盖 | 场均积分 | 场均进球 | 场均失球 | 场均xG | 场均射门 | 场均射正 | 平均控球 | 进攻评分 | 防守评分 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for team in processing_teams:
             lines.append(
-                f"| {team.get('displayName') or '-'} | {team.get('validCount', '-')} | "
+                f"| {team.get('displayName') or '-'} | {team.get('validCount', '-')} | {team.get('technicalCount', '-')} | "
                 f"{_num(team.get('pointsPerGame'))} | {_num(team.get('goalsForAverage'))} | "
-                f"{_num(team.get('goalsAgainstAverage'))} | {_num(team.get('attackRating'))} | "
+                f"{_num(team.get('goalsAgainstAverage'))} | {_num(team.get('xgAverage'))} | "
+                f"{_num(team.get('shotsAverage'))} | {_num(team.get('shotsOnTargetAverage'))} | "
+                f"{_num(team.get('possessionAverage'))} | {_num(team.get('attackRating'))} | "
                 f"{_num(team.get('defenseRating'))} |"
             )
         lines.append("")
@@ -145,8 +149,8 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
             f"- 模拟期望收益：{_money(portfolio.get('expected_profit'))}",
             f"- 期望资金：{_money(portfolio.get('expected_bankroll'))}",
             "",
-            "| 市场 | 方向 | 动作 | 赔率 | pbase 基础概率 | qmkt 市场概率 | 研究试算EV/注 | 保守研究试算EV | 说明 |",
-            "|---|---|---|---:|---:|---:|---:|---:|---|",
+                "| 市场 | 方向 | 动作 | 赔率 | 概率口径 | qmkt 市场概率 | 研究试算EV/注 | 纸上EV(p_adj) | EV计算路径 | 说明 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---|---|",
         ]
     )
     for item in recommendations:
@@ -156,10 +160,11 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
             + f"{_localized_selection(item, match)} | "
             + f"{_action_label(item.get('action'))} | "
             + f"{_odd(item.get('odds'))} | "
-            + f"{_pct(item.get('model_probability'))} | "
+            + f"{_probability_text(item)} | "
             + f"{_pct_or_dash(item.get('market_probability'))} | "
             + f"{_display_ev(item, 'expected_value_per_unit')} | "
             + f"{_display_ev(item, 'conservative_expected_value_per_unit')} | "
+            + f"{_ev_path_text(item)} | "
             + f"{item.get('reason') or '-'} |"
         )
 
@@ -170,7 +175,7 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
                 "",
                 "### 模型异常审计附录（原始研究试算，不构成信号）",
                 "",
-                "| 市场 | 方向 | 原始研究试算EV | 原始保守试算EV |",
+                "| 市场 | 方向 | 原始研究试算EV | 原始纸上试算EV |",
                 "|---|---|---:|---:|",
             ]
         )
@@ -191,9 +196,9 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
             "- 本报告只看 90 分钟赛果。",
             "- 展示融合概率仅用于比较，不是已验证的 pfinal。",
             "- 当前研究试算 EV 基于 pbase 与市场价格；在 pshr/pfinal 经校准回测验证前，API 模式不得产生正式模拟信号。",
-            "- 当基础模型与 Pinnacle 去水概率发生重大分歧时，主界面与模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
+            "- 当基础模型与当前市场基准去水概率发生重大分歧时，主界面与模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
             "- 当前时间切分校准审计仅覆盖胜平负；大小球和让球仍需独立的比分分布验收。",
-            "- 正式 API 模式仅使用指定庄家同一全场盘口的赔率计算 EV。",
+            "- 正式 API 模式仅使用庄家优先级中同一全场盘口的赔率计算 EV。",
             "- 本报告用于本地研究和纸上回测，不连接真实投注平台，也不保证收益。",
         ]
     )
@@ -232,15 +237,15 @@ def build_excel_report(payload: dict[str, Any]) -> bytes:
     row = _write_table(sheet, row + 1, "最可能比分", ["比分", "概率"], data["score_rows"], section_fill, section_font, header_fill, header_font, body_font)
     row = _write_table(sheet, row + 1, "数据质量与市场完整性", ["市场", "状态", "盘口", "说明"], data["quality_rows"], section_fill, section_font, header_fill, header_font, body_font)
     if data["processing_rows"]:
-        row = _write_table(sheet, row + 1, "数据处理审计", ["球队", "有效场数", "场均积分", "场均进球", "场均失球", "进攻评分", "防守评分"], data["processing_rows"], section_fill, section_font, header_fill, header_font, body_font)
+        row = _write_table(sheet, row + 1, "数据处理审计", ["球队", "有效场数", "技术覆盖", "场均积分", "场均进球", "场均失球", "场均xG", "场均射门", "场均射正", "平均控球", "进攻评分", "防守评分"], data["processing_rows"], section_fill, section_font, header_fill, header_font, body_font)
     if data["recent_match_rows"]:
-        row = _write_table(sheet, row + 1, "近期比赛明细", ["球队", "北京时间", "对手", "赛事", "主客", "比分", "结果"], data["recent_match_rows"], section_fill, section_font, header_fill, header_font, body_font)
-    row = _write_table(sheet, row + 1, "模拟舱", ["市场", "方向", "动作", "赔率", "pbase 基础概率", "qmkt 市场概率", "研究试算EV/注", "保守研究试算EV", "说明"], data["recommendation_rows"], section_fill, section_font, header_fill, header_font, body_font)
+        row = _write_table(sheet, row + 1, "近期比赛明细", ["球队", "北京时间", "对手", "赛事", "主客", "比分", "xG", "射门", "射正", "控球", "红牌", "点球", "结果"], data["recent_match_rows"], section_fill, section_font, header_fill, header_font, body_font)
+    row = _write_table(sheet, row + 1, "模拟舱", ["市场", "方向", "动作", "赔率", "概率口径", "qmkt 市场概率", "研究试算EV/注", "纸上EV(p_adj)", "EV计算路径", "说明"], data["recommendation_rows"], section_fill, section_font, header_fill, header_font, body_font)
     if data["audit_rows"]:
-        row = _write_table(sheet, row + 1, "模型异常审计（原始试算，不构成信号）", ["市场", "方向", "原始研究试算EV", "原始保守试算EV"], data["audit_rows"], section_fill, section_font, header_fill, header_font, body_font)
+        row = _write_table(sheet, row + 1, "模型异常审计（原始试算，不构成信号）", ["市场", "方向", "原始研究试算EV", "原始纸上试算EV"], data["audit_rows"], section_fill, section_font, header_fill, header_font, body_font)
     _write_table(sheet, row + 1, "数据提示", ["说明"], [[note] for note in data["notes"]], section_fill, section_font, header_fill, header_font, body_font)
 
-    widths = [18, 18, 14, 14, 14, 14, 14, 14, 42]
+    widths = [18, 18, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 42]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     for rows in sheet.iter_rows():
@@ -369,7 +374,7 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
     away = _localized_team(match, "away", "球队B")
     league = _localized_league(meta)
     kickoff = str(meta.get("kickoffBeijing") or meta.get("kickoff") or "-")
-    required_bookmaker, received_bookmaker = _bookmaker_labels(payload)
+    bookmaker_priority, received_bookmaker = _bookmaker_labels(payload)
     generated_at = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S 北京时间")
     quality_markets = data_quality.get("markets") or []
     processing_teams = _localized_processing_teams(processing, match)
@@ -384,6 +389,12 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
                     item.get("leagueZh") or "-",
                     item.get("venueLabel") or "-",
                     f"{item.get('goalsFor', '-')} - {item.get('goalsAgainst', '-')}",
+                    _num(item.get("xg")),
+                    _num(item.get("shots")),
+                    _num(item.get("shotsOnTarget")),
+                    _num(item.get("possessionPct")),
+                    item.get("redCards") if item.get("redCards") is not None else "-",
+                    item.get("penalties") if item.get("penalties") is not None else "-",
                     item.get("resultLabel") or "-",
                 ]
             )
@@ -400,9 +411,14 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
             ("赛事名称", league),
             ("开赛时间", kickoff),
             ("场地", meta.get("venue") or "-"),
-            ("指定庄家", required_bookmaker),
-            ("已取得盘口庄家", received_bookmaker),
+            ("庄家优先级", bookmaker_priority),
+            ("实际盘口庄家", received_bookmaker),
             ("赔率抓取时间", meta.get("oddsCapturedAtBeijing") or meta.get("oddsCapturedAt") or "-"),
+            ("数据抓取模式", meta.get("collectionModeZh") or (processing.get("collectionModeZh") if processing else "-")),
+            (
+                "技术统计覆盖",
+                f"{meta.get('deepStatsMatches') if meta.get('deepStatsMatches') is not None else (processing.get('deepStatsMatches') if processing else '-')} 场",
+            ),
             (
                 "近期有效比赛",
                 f"{home} {meta.get('recentMatchesHome', '-')} 场 / {away} {meta.get('recentMatchesAway', '-')} 场",
@@ -439,9 +455,14 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
             [
                 team.get("displayName") or "-",
                 team.get("validCount", "-"),
+                team.get("technicalCount", "-"),
                 _num(team.get("pointsPerGame")),
                 _num(team.get("goalsForAverage")),
                 _num(team.get("goalsAgainstAverage")),
+                _num(team.get("xgAverage")),
+                _num(team.get("shotsAverage")),
+                _num(team.get("shotsOnTargetAverage")),
+                _num(team.get("possessionAverage")),
                 _num(team.get("attackRating")),
                 _num(team.get("defenseRating")),
             ]
@@ -464,24 +485,25 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
                 _localized_selection(item, match),
                 _action_label(item.get("action")),
                 _odd(item.get("odds")),
-                _pct(item.get("model_probability")),
+                _probability_text(item),
                 _pct_or_dash(item.get("market_probability")),
                 _display_ev(item, "expected_value_per_unit"),
                 _display_ev(item, "conservative_expected_value_per_unit"),
+                _ev_path_text(item),
                 item.get("reason") or "-",
             ]
             for item in recommendations
         ]
-        or [["-", "-", "-", "-", "-", "-", "-", "-", "-"]],
+        or [["-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]],
         "audit_rows": _audit_rows(recommendations, match),
         "notes": list(notes) if notes else ["暂无"],
         "boundaries": [
             "本报告只看 90 分钟赛果。",
             "展示融合概率仅用于比较，不是已验证的 pfinal。",
             "当前研究试算 EV 基于 pbase 与市场价格；在 pshr/pfinal 经校准回测验证前，API 模式不得产生正式模拟信号。",
-            "基础模型与 Pinnacle 去水概率重大分歧时，模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
+            "基础模型与当前市场基准去水概率重大分歧时，模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
             "当前时间切分校准审计仅覆盖胜平负；大小球和让球仍需独立的比分分布验收。",
-            "正式 API 模式仅使用指定庄家同一全场盘口的赔率计算 EV。",
+            "正式 API 模式仅使用庄家优先级中同一全场盘口的赔率计算 EV。",
             "本报告用于本地研究和纸上回测，不连接真实投注平台，也不保证收益。",
         ],
     }
@@ -624,14 +646,55 @@ def _pct(value: Any) -> str:
         return "-"
 
 
+def _probability_text(item: dict[str, Any]) -> str:
+    label = str(item.get("model_probability_label") or "").strip()
+    value = _pct(item.get("model_probability"))
+    if not label:
+        label = "模型胜率" if item.get("market") == "胜平负" else "正收益概率"
+    return f"{label} {value}"
+
+
 def _pct_or_dash(value: Any) -> str:
     return _pct(value)
 
 
 def _display_ev(item: dict[str, Any], key: str) -> str:
-    if item.get("ev_status") == SUSPENDED_EV_STATUS:
+    if item.get("ev_status") in SUSPENDED_EV_STATUSES:
         return "暂停"
     return _pct_or_dash(item.get(key))
+
+
+def _ev_path_text(item: dict[str, Any]) -> str:
+    if item.get("ev_status") in SUSPENDED_EV_STATUSES:
+        return "模型分歧超限，EV 已暂停；原始试算仅供审计。"
+    calc = item.get("ev_calculation") or {}
+    if not isinstance(calc, dict) or not calc.get("formula"):
+        return "-"
+
+    calc_type = str(calc.get("type") or "")
+    odds = _odd(calc.get("odds"))
+    ev = _pct_or_dash(calc.get("expectedValue"))
+    paper_ev = _pct_or_dash(calc.get("paperExpectedValue") if calc.get("paperExpectedValue") is not None else calc.get("conservativeExpectedValue"))
+    p_adj = _pct_or_dash(calc.get("adjustedProbability"))
+    shrink_k = _num(calc.get("shrinkK"))
+    if calc_type == "1X2":
+        return (
+            f"EV = pbase {_pct(calc.get('modelProbability'))} × 赔率 {odds} - 1 = {ev}；"
+            f"展开为盈利概率 {_pct(calc.get('modelProbability'))} × 净赔付 "
+            f"{_num((float(calc.get('odds') or 0.0) - 1.0) if calc.get('odds') else None)} "
+            f"- 亏损概率 {_pct(calc.get('lossStakeFraction'))}；"
+            f"p_adj {p_adj}，shrink_k {shrink_k}；纸上EV {paper_ev}。"
+        )
+
+    settlement = calc.get("settlement") or {}
+    return (
+        f"{calc.get('formula') or 'EV'}：盈利注权重 {_num(calc.get('winStakeFraction'))} × "
+        f"(赔率 {odds} - 1) - 亏损注权重 {_num(calc.get('lossStakeFraction'))} = {ev}；"
+        f"全赢 {_pct(settlement.get('fullWinProbability'))}，半赢 {_pct(settlement.get('halfWinProbability'))}，"
+        f"走水 {_pct(settlement.get('pushProbability'))}，半输 {_pct(settlement.get('halfLossProbability'))}，"
+        f"全输 {_pct(settlement.get('fullLossProbability'))}；"
+        f"盈亏平衡赔率 {_odd(calc.get('breakEvenOdds'))}；p_adj {p_adj}，shrink_k {shrink_k}；纸上EV {paper_ev}。"
+    )
 
 
 def _audit_rows(recommendations: list[dict[str, Any]], match: dict[str, Any]) -> list[list[str]]:
@@ -640,10 +703,10 @@ def _audit_rows(recommendations: list[dict[str, Any]], match: dict[str, Any]) ->
             str(item.get("market") or "-"),
             _localized_selection(item, match),
             _pct_or_dash(item.get("audit_expected_value_per_unit")),
-            _pct_or_dash(item.get("audit_conservative_expected_value_per_unit")),
+            _pct_or_dash(item.get("audit_paper_expected_value_per_unit") if item.get("audit_paper_expected_value_per_unit") is not None else item.get("audit_conservative_expected_value_per_unit")),
         ]
         for item in recommendations
-        if item.get("ev_status") == SUSPENDED_EV_STATUS
+        if item.get("ev_status") in SUSPENDED_EV_STATUSES
         and item.get("audit_expected_value_per_unit") is not None
     ]
 
@@ -656,11 +719,7 @@ def _localized_selection(item: dict[str, Any], match: dict[str, Any]) -> str:
 def _report_safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if (payload.get("modelAudit") or {}).get("evSuspended"):
         return payload
-    meta = payload.get("meta") or {}
-    market = payload.get("market") or {}
-    required_bookmaker = meta.get("requiredBookmaker") or market.get("requiredBookmaker") or ""
-    if str(required_bookmaker).casefold() != "pinnacle":
-        return payload
+    benchmark = _bookmaker_for_safe_audit(payload)
     probabilities = payload.get("probabilities") or {}
     pbase = probabilities.get("pbase") or probabilities.get("model") or {}
     qmkt = probabilities.get("qmkt") or probabilities.get("market") or {}
@@ -676,7 +735,7 @@ def _report_safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     safe = deepcopy(payload)
     reason = (
-        f"模型分歧异常：{labels[trigger_key]} 的 pbase 与 Pinnacle 去水概率相差 "
+        f"模型分歧异常：{labels[trigger_key]} 的 pbase 与 {benchmark} 去水概率相差 "
         f"{max_gap * 100:.1f} 个百分点，超过 {MODEL_DIVERGENCE_LIMIT * 100:.1f} 个百分点；"
         "本场所有市场 EV 暂停计算，仅供模型复核。"
     )
@@ -695,9 +754,21 @@ def _report_safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         item["audit_expected_value_per_unit"] = item.get("expected_value_per_unit")
         item["audit_conservative_expected_value_per_unit"] = item.get("conservative_expected_value_per_unit")
+        item["audit_paper_expected_value_per_unit"] = (
+            item.get("paper_expected_value_per_unit") or item.get("conservative_expected_value_per_unit")
+        )
+        item["ev_pbase_research"] = item.get("ev_pbase_research") or item.get("expected_value_per_unit")
+        item["conservative_ev_pbase_research"] = (
+            item.get("conservative_ev_pbase_research")
+            or item.get("conservative_expected_value_per_unit")
+        )
+        item["ev_pfinal_exec"] = None
+        item["signal_status"] = "SUSPENDED"
         item["expected_value_per_unit"] = None
         item["conservative_expected_value_per_unit"] = None
-        item["ev_status"] = SUSPENDED_EV_STATUS
+        item["paper_expected_value_per_unit"] = None
+        item["ev_status"] = "MODEL_MARKET_CONFLICT"
+        item["decision_status"] = "MODEL_MARKET_CONFLICT"
         item["action"] = "WATCH"
         item["stake"] = 0.0
         item["reason"] = reason
@@ -751,23 +822,38 @@ def _line(value: Any) -> str:
 def _bookmaker_labels(payload: dict[str, Any]) -> tuple[str, str]:
     meta = payload.get("meta") or {}
     market = payload.get("market") or {}
-    required = (
-        meta.get("requiredBookmaker")
-        or market.get("requiredBookmaker")
-        or meta.get("bookmaker")
-        or "-"
-    )
-    if "selectedBookmaker" in market:
+    priority = meta.get("bookmakerPriority") or market.get("bookmakerPriority")
+    if isinstance(priority, list):
+        required = " > ".join(str(item) for item in priority if str(item).strip()) or "-"
+    else:
+        required = str(priority or meta.get("requiredBookmaker") or market.get("requiredBookmaker") or "-")
+    selected = market.get("selectedBookmakers") or meta.get("selectedBookmakers")
+    if isinstance(selected, dict) and selected:
+        labels = {"1X2": "胜平负", "OU": "大小球", "AH": "让球"}
+        received = "，".join(f"{labels.get(key, key)}={value}" for key, value in selected.items())
+    elif "selectedBookmaker" in market:
         received = market.get("selectedBookmaker") or "未取得"
     else:
         received = meta.get("bookmaker") or "未取得"
     return str(required), str(received)
 
 
+def _bookmaker_for_safe_audit(payload: dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    market = payload.get("market") or {}
+    selected = market.get("selectedBookmakers") or meta.get("selectedBookmakers")
+    if isinstance(selected, dict):
+        return str(selected.get("1X2") or market.get("selectedBookmaker") or meta.get("bookmaker") or "当前市场基准")
+    return str(market.get("selectedBookmaker") or meta.get("bookmaker") or "当前市场基准")
+
+
 def _action_label(value: Any) -> str:
     return {
-        "BUY": "研究通过",
-        "PAPER_BUY": "演示候选",
+        "BUY": "模型候选（未执行）",
+        "PAPER_BUY": "纸上观察",
         "WATCH": "观望",
         "NO_MARKET": "市场缺失",
+        "MODEL_CANDIDATE": "模型候选（未执行）",
+        "RESEARCH_WATCH": "研究观察",
+        "SUSPENDED": "暂停复核",
     }.get(str(value or ""), str(value or "-"))

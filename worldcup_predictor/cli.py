@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 from .api_football import ApiFootballError
 from .auto_predict import run_auto_prediction
+from .batch_collect import collect_daily_batch
 from .betting import DEFAULT_MIN_EDGE
 from .data import load_fixtures, load_teams
 from .localization import (
@@ -24,10 +25,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Predict a football match with explainable team, market, context, and narrative factors.",
     )
     parser.add_argument("--auto", action="store_true", help="Fetch match data from API-Football by team names.")
+    parser.add_argument("--batch-collect-today", action="store_true", help="Run daily batch collection for pre-match fixtures.")
     parser.add_argument("--home", help="Home/team A name for auto mode.")
     parser.add_argument("--away", help="Away/team B name for auto mode.")
     parser.add_argument("--fixture-id", type=int, help="API-Football fixture id. Optional but more precise.")
     parser.add_argument("--api-key", help="API-Football key. Defaults to API_FOOTBALL_KEY env var.")
+    parser.add_argument(
+        "--collection-mode",
+        choices=["fast", "deep", "batch"],
+        default="deep",
+        help="API data collection mode. Default is deep for single-match analysis.",
+    )
+    parser.add_argument("--date", help="Batch collection date in Asia/Shanghai, for example 2026-05-28.")
+    parser.add_argument("--scope", choices=["first_division", "all"], default="first_division", help="Batch collection fixture scope.")
+    parser.add_argument("--limit", type=int, help="Batch collection fixture limit.")
     parser.add_argument("--teams", default="data/sample_teams.csv", help="Path to team ratings CSV.")
     parser.add_argument("--fixtures", default="data/sample_fixtures.csv", help="Path to fixtures CSV.")
     parser.add_argument("--match-id", help="Match id from the fixture CSV.")
@@ -58,6 +69,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.batch_collect_today:
+        try:
+            batch = collect_daily_batch(
+                date=args.date,
+                scope=args.scope,
+                limit=args.limit,
+                collection_mode="batch" if args.collection_mode == "deep" else args.collection_mode,
+                api_key=args.api_key,
+            )
+        except ApiFootballError as exc:
+            parser.error(str(exc))
+        if args.json:
+            print(json.dumps(batch, ensure_ascii=False, indent=2))
+        else:
+            print(batch["message"])
+            for item in batch["collected"]:
+                print(f"- 运行 {item['runId']}: {item['home']} vs {item['away']} · {item['league']} · {item['kickoffBeijing']}")
+        return 0
+
     if args.auto:
         if not args.home or not args.away:
             parser.error("--auto requires --home and --away.")
@@ -67,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.away,
                 api_key=args.api_key,
                 fixture_id=args.fixture_id,
+                collection_mode=args.collection_mode,
                 market_weight=args.market_weight,
                 bankroll=args.bankroll,
                 unit_stake=args.unit,
@@ -133,20 +164,21 @@ def format_auto_result(auto_result) -> str:
     ]
     for item in auto_result.recommendations:
         selection = localize_selection(item.selection, result.home_team, result.away_team)
+        probability_label = item.model_probability_label or ("模型胜率" if item.market == "胜平负" else "正收益概率")
         lines.append(
             "- "
             + f"{item.market}: {selection} | 动作: {_action_label(item.action)} | "
-            + f"赔率: {_odd(item.odds)} | 模型: {_pct(item.model_probability)} | "
+            + f"赔率: {_odd(item.odds)} | {probability_label}: {_pct(item.model_probability)} | "
             + f"市场: {_pct_or_dash(item.market_probability)} | "
             + f"优势: {_pct_or_dash(item.edge)} | 研究试算EV/注: {_ev(item.expected_value_per_unit)} | "
-            + f"保守研究试算EV: {_ev(item.conservative_expected_value_per_unit)} | "
+            + f"纸上EV: {_ev(item.paper_expected_value_per_unit)} | "
             + item.reason
         )
-        if item.ev_status == "SUSPENDED_MODEL_DIVERGENCE":
+        if item.ev_status in {"SUSPENDED_MODEL_DIVERGENCE", "MODEL_MARKET_CONFLICT", "SUSPENDED"}:
             lines.append(
                 "  审计原始试算（不构成信号）: "
                 + f"EV/注 {_ev(item.audit_expected_value_per_unit)} | "
-                + f"保守EV {_ev(item.audit_conservative_expected_value_per_unit)}"
+                + f"纸上EV {_ev(item.audit_paper_expected_value_per_unit)}"
             )
     if auto_result.data_notes:
         lines.extend(["", "数据提示"])
@@ -232,10 +264,13 @@ def _ev(value: float | None) -> str:
 
 def _action_label(value: str) -> str:
     return {
-        "BUY": "研究通过",
-        "PAPER_BUY": "演示候选",
+        "BUY": "模型候选（未执行）",
+        "PAPER_BUY": "纸上观察",
         "WATCH": "观望",
         "NO_MARKET": "市场缺失",
+        "MODEL_CANDIDATE": "模型候选（未执行）",
+        "RESEARCH_WATCH": "研究观察",
+        "SUSPENDED": "暂停复核",
     }.get(value, value or "-")
 
 

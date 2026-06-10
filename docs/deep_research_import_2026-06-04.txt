@@ -1,0 +1,1112 @@
+
+
+===== PAGE 1 =====
+
+世界杯预测项⽬深度研究与可落地改造⽅案
+项⽬判断
+⼀、核⼼结论
+你这个项⽬当前可以交付为“⾜球预测研究 + 纸上模拟舱 + 赛后审计系统”，但不能交付为“已验证正期望正
+式执⾏系统”。原因不在⻚⾯，⽽在概率治理链路还没有闭环：当前 pfinalStatus=not_approved、
+formalEvEnabled=false，合格赛前样本、独⽴⽐赛数、校准区间和验证区间都远未达到可审批状态；⽽且你
+上传的项⽬审查报告已经明确指出，验证区间⾥ pshr 不但没有显著优于市场，反⽽落后于市场基准。
+ﬁleciteturnﬁle
+短期内最正确的⽅向不是“找⼀个更会出⾼ EV 的模型”，⽽是把底层对象改成同庄家、同盘⼝、同时间点、可
+回测、可校准、可审计的概率与分布体系：先把 pbase、qmkt、pshr、pfinal 的职责完全拆开，再把⼤
+⼩球和让球从“⽅向概率”改成“结算⼀致的分布预测”。概率模型在下注场景⾥⾸先要追求校准⽽不是表⾯
+命中率；Brier 和 LogLoss 是严格 proper scoring rules，但它们同时混合了 calibration、resolution 和
+uncertainty，所以正式审批⼀定要把分层校准误差单独拉出来看。
+对当前项⽬来说，最值得落地的主线不是上更复杂的深度模型，⽽是采⽤市场锚定的⽐分分布 + 基础模型收缩
++ 独⽴时间切分校准。⾜球⽐分建模的经典起点是 Poisson 类模型，Dixon-Coles 对低⽐分相关性做修正，近年
+的研究也反复表明，把历史数据与博彩公司赔率结合起来，⽐单独依赖任何⼀⽅更稳；⽽更近期的⾜球市场校
+准研究也显⽰，市场校准本⾝就是提升预测质量的主驱动项。
+⼆、当前模型最⼤缺陷
+我建议把当前最⼤缺陷按“会不会直接导致假阳性 EV”来排，⽽不是按⼯程实现难度来排。下⾯这五项，优先
+级都⾼于任何⻚⾯美化。
+缺陷 当前证据 为什么危险 ⽴即改法
+样本与验证不
+⾜
+你当前合格赛前样本 15/100、
+独⽴⽐赛 15/100、校准区间
+3/20、验证区间 3/20
+在这种量级下，ROI 与命中率⼏
+乎没有审批意义，容易把⽅差
+误当成 edge
+正式 EV 继续关
+闭；只做研究候
+选与纸上复盘
+pbase 冷⻔
+偏乐观
+报告已指出⾼ EV 冷⻔⼤量亏
+损，且“模型分歧暂停组”表
+现明显更差
+⼗进制赔率越⾼，概率误差对
+EV 的杠杆越⼤
+让市场收缩系数
+随⻓赔率和分歧
+⾃动上升
+⼤⼩球分布未
+校准
+复盘⾥⼤⼩球 EV 已结算净亏明
+显
+总进球分布⼀旦偏斜，
+2.25/2.75 这类四分之⼀盘会被
+系统性误价
+改成市场锚定总
+进球均值 + 线别
+校准
+让球仍缺“净
+胜球分布校
+准”
+你现在已经能按⽐分矩阵算
+EV，但还没把净胜球分布单独
+审批
+AH 本质上不是单个⽅向概率问
+题，⽽是 margin distribution
+问题
+以净胜球 CDF/
+PMF 为对象做校
+准与回测
+1
+2
+1
+
+
+===== PAGE 2 =====
+
+缺陷 当前证据 为什么危险 ⽴即改法
+模拟舱还不是
+组合级资⾦系
+统
+报告明确指出缺少按开赛时间
+排序的扣款、结算、再分配和
+相关性控制
+多场同时开球会让纸⾯ ROI 与
+真实资⾦曲线脱节
+先做按时间线驱
+动的账本引擎，
+再谈正式 BUY
+这些判断与项⽬当前状态直接⼀致；从⽅法论上，之所以把“校准优先于命中率”和“市场锚定优先于纯模型
+⾃信”放在更前⾯，是因为体育投注场景⾥，未经校准的⾼置信度输出最容易制造伪 edge，⽽历史数据与盘⼝
+信息的结合在⾜球得分建模⾥通常⽐单独使⽤任⼀⽅更稳。ﬁleciteturnﬁle 
+概率治理与 EV
+三、EV 公式逐项审查
+先说结论：当前 EV 公式应该保留，但只能保留为研究指标，不得继续假装接近正式买⼊信号。
+市场 当前公式 是否保留 结论 数学⻛险
+胜平
+负 EV = p × odds - 1 保留为研
+究指标 公式本⾝正确 概率误差会被⾼赔率线
+性放⼤
+⼤⼩
+球
+EV = Σ P_score(s) × 
+net_return(s) 保留 ⽅向正确，⽽且优
+于“正收益概率”近似
+⻛险在⽐分分布错，不
+在 EV 算式本⾝
+让球 EV = Σ P_score(s) × 
+net_return(s) 保留 ⽅向正确，必须继续沿
+分布做
+⻛险在净胜球分布和四
+分之⼀盘结算映射
+这些结论有⼀个关键前提：公式正确不等于概率对象合格。对于胜平负，若⼗进制赔率为 o，则 
+EV = p·o - 1；⼀旦你的概率有误差 Δp，EV 误差就是 ΔEV = o·Δp。这意味着在 1.80 的热⻔位上 3 个
+百分点误差只会带来 0.054 的 EV 偏差，但在 6.00 的冷⻔位上，同样 3 个百分点误差会带来 0.18 的 EV 偏差，
+⾜以把很多本来为负的标的翻成“⾼ EV”。这与博彩市场⻓期存在的 favorite-longshot bias ⾼度⼀致，所以
+胜平负研究 EV 必须继续保留，但必须显式改名为 research_ev_pbase，并且禁⽌作为正式信号。
+对于⼤⼩球和让球，你现在⽤⽐分矩阵对全赢、半赢、⾛⽔、半输、全输做结算期望，这条路线是对的，因为
+proper scoring 与结算⼀致性要求模型输出能映射到真实 payout，⽽不是只给⼀个“正收益概率”。你上传的
+报告已经指出：把四分之⼀盘近似成“positive probability”会失真，这个判断完全正确。真正要改的不是 EV
+公式，⽽是P_score 的构造⽅式，以及你对 qmkt 的定义⽅式。ﬁleciteturnﬁle 
+因此，我的建议不是删掉当前 EV，⽽是把⻚⾯与数据库⾥的 EV 拆成四层并显式审计：ev_pbase_research、
+ev_qmkt_anchor、ev_pshr_candidate、ev_pfinal_exec。这样你就可以把“模型看到的价值”“市场锚
+定下的价值”“候选收缩后的价值”“正式审批后的执⾏价值”严格分开，避免研究候选和正式信号混淆。
+Brier 和 LogLoss 本⾝不能单独证明模型更校准，所以 EV 永远只能作为研究后验指标，审批仍要回到时间切分
+的 scoring + calibration + ⻛险指标。
+四、pﬁnal 候选公式设计
+我建议把四层概率治理定义成下⾯这个体系。底层统⼀以⽐分分布为核⼼对象，三类市场共⽤底层分布，但分
+别⾛各⾃的校准和审批。
+3
+4
+5
+6
+2
+
+
+===== PAGE 3 =====
+
+对象 输⼊ 产物 训练/校准
+是否可
+驱动正
+式 EV
+pbase 历史赛前特征，不含执⾏盘⼝基础⽐分分布与 1X/
+OU/AH 边际概率
+训练集拟合；不
+做正式审批依据否
+qmkt 同庄家、同盘⼝、同时间点赔率
+去⽔后的 1X 市场概
+率；或同庄家市场锚定
+⽐分分布
+不依赖结果训练
+或只做离线⽅法
+选择
+否
+pshr
+pbase + qmkt + 质量折扣 + 联
+赛/样本折扣 + 分歧惩罚 + ⻓赔
+率惩罚
+候选收缩分布/概率
+训练窗⼝⽣成；
+校准窗⼝独⽴拟
+合
+否
+pfinal 冻结版 pshr + 市场专项校准器正式执⾏概率/分布 验证窗⼝独⽴审
+批后冻结 是
+这个治理结构的核⼼依据是两点：第⼀，⾜球⽐分建模本来就适合⽤ Poisson / Dixon-Coles ⼀类的⽐分分布；
+第⼆，把历史信号与赔率信息结合起来，会⽐单独依赖⼀边更稳，⽽ recent football market-calibration 研究
+也表明市场校准本⾝是主要增益来源。
+我建议把 pfinal 的候选底层公式直接写成“⽐分分布混合”，⽽不是先在胜平负上混、再在⼤⼩球上另起⼀
+套。这样代码更统⼀，审计也更统⼀：
+P_base(g_h, g_a)  = pbase 的⽐分分布
+P_mkt(g_h, g_a)   = qmkt 的同庄家市场锚定⽐分分布
+Q_data            = 数据质量分数 ∈ [0,1]
+Q_league          = 联赛/样本分数 ∈ [0,1]
+D                 = 模型-市场分歧度
+L                 = ⻓赔率冷⻔惩罚项
+α                 = 市场收缩权重
+β                 = 基础模型有效权重
+α = clip(
+      α0
+    + wq * (1 - Q_data)
+    + wn * (1 - Q_league)
+    + wd * D
+    + wl * L,
+    α_min, α_max
+)
+β = (1 - α) * Q_data * Q_league
+P_shr(g_h, g_a) ∝ P_mkt(g_h, g_a)^α × P_base(g_h, g_a)^β
+Q_data 我建议由四项组成：特征覆盖率、盘⼝完整性、快照时效、同庄家双边完整性。Q_league 不要⼿⼯
+按“豪⻔联赛/⼩联赛”拍脑袋，⽽是由该联赛已结算样本量、盘⼝覆盖率、同庄家可⽐率共同得出。D 则不
+要⽤⾁眼判断，⽽是量化成 1X 上的 JS divergence，或总进球均值/净胜球中⼼的标准化距离。L 也不要硬阈
+7
+3
+
+
+===== PAGE 4 =====
+
+值砍掉，⽽是让⻓赔率时 α ⾃动升⾼，等价于“越冷⻔，越相信市场，越少相信模型尾部”。这种设计
+⽐“简单 probability discount”更稳，因为它把折扣作⽤在概率层，⽽不是在 EV 末端硬扣分。
+在这个底层分布之上，正式 pfinal 再⾛市场专项校准：
+pfinal_1x2 = Cal_1x2( Marginal_1x2(P_shr) )
+pfinal_ou  = Cal_ou( SettlementVector_OU(P_shr, line, side, odds) )
+pfinal_ah  = Cal_ah( SettlementVector_AH(P_shr, line, side, odds) )
+其中：
+Cal_1x2：样本较少时先⽤温度缩放 / Platt ⻛格标定；样本⾜够且三类⽀持充分时升级为 Dirichlet
+calibration。
+Cal_ou：对⼤⼩球票据的结算状态向量 {全赢, 半赢, ⾛⽔, 半输, 全输} 做线别校准。
+Cal_ah：对让球票据的净胜球 CDF / 结算状态向量做单独校准。
+这类 post-hoc calibration 必须只在独⽴于训练集的校准窗⼝⾥拟合；scikit-learn ⽂档也明确强调，若⽤训练
+集⾃⼰的输出去拟合 calibrator，会系统性产⽣偏到 0/1 两端的假校准。多分类场景下，Dirichlet calibration
+正是为这类问题设计的。
+在审批逻辑上，我建议把 pfinal 分成两个⻔槛。第⼀层是“可⽣成候选”，第⼆层才是“可驱动正式 EV”。
+在你当前样本远不⾜的情况下，pshr 可以继续⽣成，pfinal 继续保持 not_approved。只要审批⻔槛没
+过，⻚⾯上就只显⽰ pfinal_candidate，不允许占⽤正式资⾦。这个约束与你现在的⻛控⼝径完全⼀致，也
+应该继续保持。ﬁleciteturnﬁle
+市场校准⽅案
+五、三类市场独⽴校准⽅案
+三类市场虽然共享⼀个底层⽐分分布，但审批必须独⽴。原因很简单：1X 是三分类；⼤⼩球的⻛险集中在总
+进球分布与线别；让球的⻛险集中在净胜球分布与四分之⼀盘结算。把三类市场揉在⼀处看总 ROI，只会把问
+题藏掉。并且，Brier 与 LogLoss 是 proper scoring rules，但不能替代 calibration error；标准 ECE 还会受分
+箱影响，所以正式报表⾥我建议同时保留 ECE 与 SmoothECE 或等价的稳健校准误差。
+先说胜平负。这⼀层最适合继续⽤赔率与基础模型的多分类校准。pbase 可以来⾃层级化 Poisson / Dixon-
+Coles ⽐分模型；qmkt 则来⾃同庄家 1X 去⽔概率。对于去⽔⽅法，我建议当前版本默认使⽤Power
+method 作为 1X 的稳健基线，因为它⽐最简单的 proportional normalization 更能处理 favorite-longshot
+bias；同时把 OO-EPC 与 FL-GLM 作为 P 阶段的离线基准实验，⽽不是直接上⽣产，因为那是 2026 年⾮常新
+的⽅法，值得 benchmark，但不该在样本还不够时直接当默认真理。
+再说⼤⼩球。这⾥必须把“研究对象”从“Over / Under ⽅向概率”改成“总进球分布”。⼏种可选⽅案的取
+舍如下：
+⽅案 优点 缺点 对当前项⽬
+适配度
+纯 Poisson 参数少、最稳、最好落
+地 低⽐分相关性和尾部厚度刻画不⾜ ⾼
+8
+· 
+· 
+· 
+9
+10
+11
+4
+
+
+===== PAGE 5 =====
+
+⽅案 优点 缺点 对当前项⽬
+适配度
+Dixon-Coles 低⽐分修正有效，⾏业
+⾥⾮常常⻅ ⽐纯 Poisson 多⼀层校准复杂度 很⾼
+负⼆项 能处理过度离散和厚尾数据少时不稳，参数更难批量维护 中
+市场锚定总进球
+均值
+最贴近盘⼝，低样本时
+尤其稳 需要同庄家线与双边赔率完整 很⾼
+xG 校准 理论上更接近进球⽣成
+机制
+xG 提供商⼝径不⼀、赛前 coverage 不
+稳、样本少时易引偏差
+当前不宜做
+主模型
+Poisson 是⾜球⽐分建模最经典的起点；Dixon-Coles 的核⼼价值在于专⻔修正低⽐分联动；⽽负⼆项在⼀些联
+赛和赛事集合中确实更能解释厚尾，但会提⾼参数⽅差。xG 的问题不是它没价值，⽽是不同提供商⼝径不同，
+⽽且 xG 本⾝也可能带 subgroup bias；在你现在这种以 API-Football 为主、样本量还明显不⾜的项⽬⾥，把
+xG 直接抬成主校准对象，⻛险⾼于收益。
+所以，当前最适合落地的版本是：市场锚定的 DC-lite。具体实现如下。先⽤同庄家 1X 与主⼤⼩球盘，拟合⼀
+个市场锚定⽐分分布 P_mkt；再⽤基础模型给出 P_base；然后按上⼀节公式做分布级 shrinkage，最后对不
+同总进球线族做 post-hoc calibration。代码层建议先只维护⼀个全局 ρ_dc（或按联赛⼤类维护少数⼏个 
+ρ），不要⼀开始就按⼩联赛、盘⼝线、球队层层分裂。这样能在当前样本量下控制⽅差，同时已经⾜够把
+2.25、2.5、2.75、3.25 这些线别区分开来。
+最后说让球。让球真正要校准的对象不是“主队让盘概率”，⽽是净胜球分布。如果底层⽐分分布是独⽴
+Poisson，则净胜球⾃然对应 Skellam 家族；若⽤ DC-lite，则直接从⽐分矩阵边际化出净胜球 PMF 即可。我的
+建议是：计算 P(M = m) 后，针对关键 cut points（例如 M > -2, M > -1, M > 0, M > 1, M > 2）做单
+调的 CDF 校准，再由校准后的 CDF 反推 PMF；这样让球的整数盘、半球盘、四分之⼀盘都能统⼀处理。亚洲
+盘需要单独验收，相关⽂献也明确指出，AH 市场与传统 1X 市场虽然有关联，但在效率与收益分布上并不相
+同，必须单独评估。
+四分之⼀盘的结算逻辑必须内置在回测引擎⾥，不能⽤⼈⼯近似。⼀个 1 单位本⾦的标准化净收益可以这样定
+义：
+盘⼝ 净胜球条件归⼀化净收益
+主队 -0.25 主胜 odds - 1
+主队 -0.25 平局 -0.5
+主队 -0.25 主负 -1
+主队 -0.75 主胜 2+ odds - 1
+主队 -0.75 主胜 1 (odds - 1)/2
+主队 -0.75 其余 -1
+主队 +0.25主胜 odds - 1
+主队 +0.25平局 (odds - 1)/2
+主队 +0.25主负 -1
+12
+7
+13
+5
+
+
+===== PAGE 6 =====
+
+盘⼝ 净胜球条件归⼀化净收益
+主队 +0.75主胜/平局 odds - 1
+主队 +0.75主负 1 -0.5
+主队 +0.75主负 2+ -1
+四分之⼀盘本质上就是把注额拆成相邻两条整盘/半盘，因此让球 EV 与回测必须以结算状态或 margin
+distribution 为核⼼对象，⽽不能退回到⼀个⼆元⽅向概率。
+模拟舱与数据结构
+六、模拟舱 V 资⾦策略
+你给出的约束⾮常清晰，我建议把模拟舱 V 做成资⾦账本驱动的离散事件系统，⽽不是⼀个“赛后⼀次性汇总
+ROI”的表。其核⼼状态只保留五类：MODEL_CANDIDATE、RESEARCH_WATCH、PAPER_BUY、NO_MARKET、
+SUSPENDED。在 pfinal 未审批通过前，所有信号最多只能到 RESEARCH_WATCH；这条纪律必须写进后端⽽不
+是靠⻚⾯⽂案提醒。ﬁleciteturnﬁle
+在资⾦定义上，我建议把“现⾦余额”和“可⽤于定注的⻛险本⾦”分开。这样才能真正实现“盈利 50% 再投
+⼊”。
+initial_bankroll = 1000
+realized_pnl_t      = 已结算累计盈亏
+reserved_stake_t    = 未结算占⽤资⾦
+cash_t              = initial_bankroll + realized_pnl_t - reserved_stake_t
+staking_bankroll_t  = initial_bankroll
+                     + min(realized_pnl_t, 0)
+                     + 0.5 * max(realized_pnl_t, 0)
+base_unit_t         = floor_to_cent( min(cash_t, staking_bankroll_t) / 5 )
+这条公式的含义是：亏损全部反映到后续注额，盈利只按 50% 提升后续注额；因此既满⾜“盈利再投⼊”，⼜
+能抑制短样本内因为⼀两笔好运⽽突然放⼤仓位。Kelly 类⽅法在数学上追求⻓期增⻓，但前提是概率已知且稳
+定；⼀旦概率估计有误，drawdown ⻛险会迅速放⼤，所以真实⼯程⾥使⽤ drawdown 约束和 fractional /
+adaptive ⻛控是必须的。
+⻛险上限我建议写成硬规则，⽽不是前端提醒：
+维度 上限
+单场总暴露 <= 当前可⽤资⾦ 40%
+单⽇总暴露 <= 当前可⽤资⾦ 60%
+单市场类型暴露<= 当前可⽤资⾦ 25%
+同联赛暴露 <= 当前可⽤资⾦ 30%
+14
+15
+6
+
+
+===== PAGE 7 =====
+
+维度 上限
+⻓赔率冷⻔暴露<= 当前可⽤资⾦ 10%，且不得与⾼分歧同时放开
+其中“同联赛暴露”和“⻓赔率冷⻔暴露”是当前版本必须补上的两条，因为同联赛、同时间窗、同市场信号
+往往⾼度相关，⽽你现在的主要亏损点⼜恰好集中在⾼赔率冷⻔。ﬁleciteturnﬁle
+连亏降档与回撤暂停也建议做成状态机：
+条件 动作
+连续亏损 3 笔 之后 5 笔，注额乘数下调到 0.6
+连续亏损 5 笔 之后 5 笔，注额乘数下调到 0.4；⻓赔率冷⻔⾃动暂停
+峰值回撤 >= 20% 暂停新 PAPER_BUY，只允许继续结算⽼单
+峰值回撤 >= 25% 进⼊ MANUAL_REVIEW_REQUIRED，需⼈⼯解除
+之所以不⽤更激进的 Kelly，是因为在概率未充分验证时，资⾦管理的任务⾸先是控制路径⻛险，⽽不是最⼤化
+名义收益。
+批量多场必须按开赛时间顺序驱动：
+defprocess_timeline(events):
+# events: kickoﬀ / settlement / rebalance
+events= sorted(events, key=lambdax: (x.event_ts, x.event_type_order))
+fore in events:
+if e.type=="kickoﬀ":
+if e.signal_status=="PAPER_BUY"andlimits_pass(e):
+reserve_stake(e.ticket_id, e.stake)
+elife.type=="settlement":
+pnl= settle_ticket(e.ticket_id)
+update_streak_and_drawdown(pnl)
+elife.type=="rebalance":
+recompute_base_unit()
+重分配周期建议采⽤“⽇初固定 + 触发式重算”：默认每天本地 00:00 重算⼀次 base_unit；若当⽇已结算后
+权益变化超过 10%，或触发连亏/回撤状态，再做⼀次紧急重算。这样既保留时间路径真实性，⼜避免每结⼀单
+就过度反应。这个版本最容易先落地。
+七、数据表与字段设计
+建议你别再把所有对象都堆在⼀张“预测记录”⾥，⽽是⾄少拆成下⾯⼋张核⼼表。这样后⾯做回测、审计、
+⻚⾯图表和导出都会简单很多。
+表名 关键字段
+fixtures fixture_id, league_id, season, kickoff_utc, home_team_id, 
+away_team_id, home_goals_ft90, away_goals_ft90, result_synced_at
+16
+16
+7
+
+
+===== PAGE 8 =====
+
+表名 关键字段
+pre_match_snapshots
+snapshot_id, fixture_id, snapshot_ts, minutes_to_kickoff, 
+feature_version, feature_coverage, lineup_known_flag, 
+injuries_coverage, form_window
+bookmaker_quotes_raw
+quote_id, fixture_id, snapshot_id, bookmaker_id, bookmaker_name, 
+market_type, line_value, side_key, odds_decimal, provider_bet_key, 
+fetched_at, is_prematch
+selected_market_quotes
+selection_id, fixture_id, market_type, line_value, side_key, 
+selected_bookmaker_id, selected_bookmaker_name, entry_odds, 
+entry_snapshot_id, selected_by_priority, same_book_integrity_flag, 
+close_odds, close_snapshot_id, clv_comparable_flag
+score_distributions
+fixture_id, model_version, distribution_role(pbase/qmkt/pshr/
+pfinal), score_matrix_json, max_goal_cap, tail_mass, mu_home, 
+mu_away, rho_dc, anchor_fit_meta_json
+probability_registry
+fixture_id, market_type, line_value, side_key, pbase_json, 
+qmkt_json, pshr_json, pfinal_json, q_data, q_league, 
+divergence_score, longshot_penalty, pfinal_status, 
+calibrator_version
+backtest_tickets
+ticket_id, backtest_run_id, fixture_id, market_type, line_value, 
+side_key, bookmaker_id, odds_entry, odds_close, prob_object_used, 
+settlement_probs_json, ev_entry, result_state, net_return, 
+clv_delta
+bankroll_ledger
+ledger_id, event_ts, action, ticket_id, bankroll_before, 
+bankroll_after, reserved_before, reserved_after, available_before, 
+available_after, streak_loss_count, drawdown_pct, risk_mode
+上⾯这些表已经可以覆盖你的核⼼审计链：原始报价 → 优先庄家选择 → 概率对象版本 → 候选/正式状态 → 回
+测票据 → 资⾦账本。你上传的报告已经提到“增加收盘赔率字段，为 CLV 做准备”，我这⾥是把它真正落实成
+表级字段。ﬁleciteturnﬁle
+除了表，还需要⼀组稳定函数模块。建议按下⾯命名落地：
+select_primary_bookmaker_quote(...)
+devig_x_power(...)
+ﬁt_samebook_market_anchor_score(...)
+build_pbase_score_matrix(...)
+blend_score_distributions(...)
+calibrate_x_dirichlet_or_temp(...)
+calibrate_ou_settlement(...)
+calibrate_ah_margin_cdf(...)
+settle_total_goals(...)
+settle_asian_handicap(...)
+run_walkforward_backtest(...)
+compute_clv(...)
+8
+
+
+===== PAGE 9 =====
+
+rebalance_bankroll_v(...)
+generate_postmortem_attribution(...)
+这些模块的边界应该⾮常清楚：赔率选择模块绝不碰赛果；校准模块绝不碰未来数据；结算模块绝不⾃⼰算概
+率；资⾦模块只读已审批信号与结算结果。 这样测试才不会糊成⼀团。
+回测与实验设计
+⼋、回测实验设计
+回测设计的核⼼原则只有⼀句话：先验证“概率对不对”，再看“钱曲线⻓什么样”，最后才看“有没有 CLV
+与⻛险可接受的执⾏性”。 这也是为什么我建议把 Brier、LogLoss、Calibration Error、ROI、最⼤回撤、命
+中率、盈亏⽐、CLV 统⼀纳⼊，但绝不允许任何⼀个短样本 ROI 单独决定是否上线。你上传的报告已经⾮常明
+确地指出了这⼀点，这个纪律必须制度化。ﬁleciteturnﬁle 
+时间切分建议统⼀采⽤expanding train + rolling calibration + rolling validation + ﬁnal holdout。如果数
+据量仍按⽐赛批次累积，就按 kickoff_time 严格排序，不允许同⼀ ﬁxture 的任何快照出现在训练与验证两
+边。校准器只能⽤“模型在校准窗上的⽆泄漏预测”来拟合；⼀旦直接拿训练集⾃⼰的预测去校准，结果会系
+统性过乐观。
+三类市场的回测验收，我建议统⼀成下⾯这张表来执⾏。
+市
+场 样本准⼊规则 评分指标 交易指标 CLV 引⼊条件 分层统计
+胜
+平
+负
+同庄家 1X 完
+整、赛前快照有
+效、90 分钟赛果
+已同步、唯⼀
+ﬁxture
+多分类 Brier、
+LogLoss、ECE /
+SmoothECE
+ROI、
+MDD、命中
+率、Proﬁt
+Factor
+同庄家、同 side、
+同 line、临近开赛
+收盘可⽐，覆盖率 
+>=70% 后纳⼊审批
+联赛、庄
+家、赔率
+区间、
+主/平/客
+⼤
+⼩
+球
+同庄家同线双边
+赔率完整；按实
+际执⾏线建票，
+不混线
+结算状态向量 {全赢, 
+半赢, ⾛⽔, 半输, 全
+输} 的 Brier、
+LogLoss、ECE
+ROI、
+MDD、命中
+率、Proﬁt
+Factor
+仅同庄家同线可
+⽐；主线与副线分
+开看
+联赛、庄
+家、赔率
+区间、盘
+⼝线
+让
+球
+同庄家同线双边
+赔率完整；按实
+际执⾏线建票，
+不混线
+结算状态向量 / margin-
+CDF 的 Brier、
+LogLoss、ECE
+ROI、
+MDD、命中
+率、Proﬁt
+Factor
+仅同庄家同线可
+⽐；四分之⼀盘单
+列
+联赛、庄
+家、赔率
+区间、盘
+⼝线
+这个设计的关键点有两个。第⼀，⼤⼩球和让球的评分对象不再是“⽅向是否命中”，⽽是与真实结算⼀致的
+状态分布。第⼆，CLV 只有在同庄家、同盘⼝线、同 side 且收盘报价存在时才进⼊审批；如果线已经跳了，
+clv_comparable_flag=false，最多做补充研究，不得拿来当正式 CLV。市场价格本⾝会持续聚合信息，越接
+近开赛的市场通常越适合作为 benchmark，因此 CLV 只能在可⽐条件下引⼊。
+审批⻔槛上，我建议把“样本⾜够”和“性能不劣于市场”都写成硬⻔槛。⼀个可落地的保守⼝径是：
+胜平负：>= 300 场独⽴已结算赛前样本，且 OOT 验证窗 >= 100 场；
+⼤⼩球：>= 400 张同线、同庄家、可结算票据，且主要盘⼝线桶每桶最好 >= 50；
+17
+18
+19
+20
+· 
+· 
+9
+
+
+===== PAGE 10 =====
+
+让球：>= 400 张同线、同庄家、可结算票据，四分之⼀盘需单独满⾜基本⽀持量。
+正式通过要求建议写成：相对 qmkt 不得在 OOT 上显著变差；最好能在 ECE 上改善，并在 Brier / LogLoss
+上⾄少⾮劣。 如果 scoring 过不了，哪怕某段 ROI 漂亮也不能开绿灯。因为 sports betting 的⼀个⽼问题是：
+看似盈利的短样本，可能只是数据清洗没做⼲净，或某个离群⼤赔率把曲线“托上去了”。最近的 replication/
+correction 研究甚⾄说明，⼀笔异常⻓赔就⾜以让整个策略看起来虚假盈利。
+针对你提到的“⾼ EV 冷⻔⼤量亏损”，我建议不要⽤“把⻔槛再提⾼⼀点”来敷衍，⽽是做下⾯这组可证伪实
+验。
+假设 为什么会发⽣ 如何验证 防⽌过拟合
+尾部校准错
+误
+pbase 在⻓赔率区间系统
+性⾼估弱者胜率
+按 qmkt 隐含概率桶分层，⽐较 
+pbase/qmkt/pshr 的尾部 ECE、
+Brier、LogLoss
+阈值与分桶先固定，
+再做 OOT；不允许看
+完结果再改桶
+去⽔⽅法错
+误
+⻓赔率区的 vig 分配不应
+使⽤过于简单的
+proportional 法
+同庄家同时间点⽐较
+Multiplicative / Power / OO-EPC
+在⻓赔率桶的 OOT scoring
+⽅法选择只在训练窗
+做，验证窗只读结果
+数据质量与
+冷⻔亏损强
+相关
+低覆盖、陈旧快照、
+fallback 庄家更容易出
+现“假价值”
+⽤ Q_data、快照时效、fallback
+深度做交互回归，检验亏损是否显
+著集中
+模型结构预注册；不
+做事后切⽚寻宝
+模型-市场分
+歧本⾝就是
+⻛险信号
+分歧⼤通常意味着市场掌
+握了模型没有的信息
+按分歧分位数看 scoring 与 ROI 的
+单调性；若分歧越⼤越差，就把它
+变成硬惩罚项
+只检验单调关系，不
+在验证窗上调最佳
+cut
+EV 异常来⾃
+脏数据/赔率
+bug
+极端⻓赔率或错价可能制
+造海市蜃楼
+建异常赔率⽩名单/⿊名单，重跑含
+异常与去异常两版回测
+所有异常规则在
+rerun 前冻结，并出
+具差异审计
+如果这些实验最后⽀持“⾼ EV 冷⻔主要死在尾部校准与分歧”，那你的改法就不应该是“把冷⻔全部 ban
+掉”，⽽应该是让市场收缩项随⻓赔率和分歧单调上升，并设计独⽴的⻓赔率⻛险预算。这样既能减少伪 EV，
+⼜不⾄于把真正偶尔存在的冷⻔价值⼀⼑切掉。
+⻚⾯与执⾏路线
+九、⻚⾯与报告改造建议
+⻚⾯现在最⼤的缺⼝不是“预测有没有输出”，⽽是“为什么给这个概率、为什么给这个 EV、为什么暂停/为
+什么没买”没被审计化。建议新增下⾯这些字段与图表。
+⻚⾯
+模块 必增字段 推荐图表 ⽬的
+概率
+审计
+卡
+pbase, qmkt, pshr, pfinal_candidate, pfinal_status, 
+q_data, q_league, divergence_score, longshot_penalty, 
+selected_bookmaker_name, devig_method
+三套概率对
+⽐条形图
+⼀眼看
+到“模型、
+市场、最终
+候选”差在
+哪⾥
+· 
+21
+22
+10
+
+
+===== PAGE 11 =====
+
+⻚⾯
+模块 必增字段 推荐图表 ⽬的
+EV
+分解
+卡
+ev_pbase_research, ev_qmkt_anchor, ev_pshr_candidate, 
+ev_pfinal_exec, delta_market_shrink, 
+delta_quality_discount, delta_league_discount, 
+delta_divergence_penalty, delta_longshot_penalty, 
+delta_special_cal
+Waterfall /
+bridge chart
+把 EV 变化拆
+开，不再只
+看⼀个最终
+数值
+分歧
+原因
+卡
+reason_codes[]，例如 LOW_DATA_QUALITY / 
+HIGH_DIVERGENCE / LONGSHOT_TAIL / MARKET_INCOMPLETE / 
+SAMEBOOK_FAIL
+规则命中热
+⼒图
+把“暂
+停”变成可
+追踪原因
+模拟
+舱卡
+cash, reserved, available, base_unit, streak_loss_count, 
+drawdown_pct, risk_mode
+资⾦曲线 +
+回撤曲线
+展⽰真实路
+径，⽽不是
+赛后总和
+赛后
+复盘
+卡
+result_state, realized_net_return, clv_delta, 
+biggest_prob_mass_scores, attribution_tags
+归因瀑布 +
+分值矩阵
+区分“模型
+错、市场
+错、结果波
+动”
+⾼
+EV
+异常
+列表
+edge_rank, odds_bucket, bookmaker, league, q_data, 
+divergence, anomaly_flag
+可筛选异常
+表
+专⻔盯⻓赔
+率与脏数据
+样本
+这些改造并不是“增加解释性⽽已”，⽽是为了把后续回测实验和审批⻔槛直接投射到产品上。尤其是 
+delta_market_shrink、delta_divergence_penalty、delta_longshot_penalty 这三块，⼀旦做出来，你
+会⾮常快地看到当前“⾼ EV 冷⻔”到底是在哪⾥被降权、哪⾥仍然漏掉。你上传报告⾥提到的“⾼ EV 异常列
+表”“模型分歧原因”“模拟舱资⾦曲线”“赛后复盘归因”，我建议全部升为⼀级模块。
+ﬁleciteturnﬁle
+⼗、P/P/P 执⾏路线
+下⾯这张表我按“先把错误做对，再把对的做稳，再把稳的做强”来排。
+优
+先
+级
+⼯作
+项 关键字段 关键函数模块 测试⽤例 验收标
+准
+P
+同庄
+家盘
+⼝选
+择与
+完整
+性治
+理
+selected_bookmaker_id, 
+same_book_integrity_flag, 
+selected_by_priority
+select_primary_bookmaker_quote()
+Pinnacle 缺失时能整体回退到
+Bet；绝不出现跨庄家拼盘
+⼝
+100%
+已执⾏
+票据可
+追溯到
+单⼀庄
+家
+11
+
+
+===== PAGE 12 =====
+
+优
+先
+级
+⼯作
+项 关键字段 关键函数模块 测试⽤例 验收标
+准
+P
+⼤⼩
+球/让
+球精
+确结
+算引
+擎
+result_state, net_returnsettle_total_goals(), 
+settle_asian_handicap()
+-0.25/-0.75/+0.25/+0.75、
+⾛⽔、半赢半输全覆盖
+单元测
+试覆盖
+所有主
+流盘⼝
+线
+P
+底层
+⽐分
+分布
+统⼀
+化
+score_matrix_json, 
+mu_home, mu_away, rho_dc
+build_pbase_score_matrix(), 
+fit_samebook_market_anchor_score(), 
+blend_score_distributions()
+概率和为 1；边际概率与分布
+⼀致
+三类市
+场均从
+同⼀底
+层分布
+出数
+P
+pshr
+候选
+链路
+与⻛
+控⻔
+禁
+q_data, q_league, 
+divergence_score, 
+longshot_penalty, 
+pfinal_status
+compute_quality_score(), 
+build_pshr_candidate()
+低质量样本⾃动 
+SUSPENDED；⻓赔率时 α 上
+升
+⻚⾯可
+展⽰候
+选，但
+正式
+EV 仍
+关闭
+P
+⾛时
+序的
+回测
+与模
+拟舱
+V
+backtest_run_id, 
+ledger_id, bankroll_after
+run_walkforward_backtest(), 
+rebalance_bankroll_v2()
+多场同⽇按开赛顺序扣款、结
+算、重分配
+能输出
+真实资
+⾦曲
+线、
+MDD、
+暴露⽇
+志
+优
+先
+级
+⼯
+作
+项
+关键字段 关键函数模块 测试⽤
+例
+验收标
+准
+P
+X
+多
+分
+类
+校
+准
+器
+calibrator_version, 
+pfinal_json calibrate_1x2_dirichlet_or_temp()
+校准集
+与训练
+集严格
+隔离
+OOT 上
+ECE 改
+善，
+Brier/
+LogLoss
+⾄少⾮
+劣
+P
+⼤
+⼩
+球
+线
+别
+校
+准
+器
+line_bucket, 
+settlement_probs_jsoncalibrate_ou_settlement()
+2.25、
+2.5、
+2.75 分
+桶不混
+主要盘
+⼝线⽆
+系统性
+反向偏
+差
+12
+
+
+===== PAGE 13 =====
+
+优
+先
+级
+⼯
+作
+项
+关键字段 关键函数模块 测试⽤
+例
+验收标
+准
+P
+让
+球
+净
+胜
+球
+CDF
+校
+准
+器
+margin_cdf_json calibrate_ah_margin_cdf()
+quarter-
+line 回
+测与整
+数盘⼀
+致衔接
+AH 票据
+评分与
+结算⼀
+致
+P
+收
+盘
+价
+与
+CLV
+审
+计
+close_odds, 
+close_snapshot_id, 
+clv_comparable_flag, 
+clv_delta
+compute_clv()
+线变动
+时⾃动
+标不可
+⽐
+CLV 只
+在同庄
+家同线
+进⼊报
+表
+P
+⻚
+⾯
+审
+计
+模
+块
+delta_* 全量字段 generate_postmortem_attribution()
+单场详
+情⻚可
+解释每
+⼀步降
+权
+⻚⾯与
+导出报
+告字段
+⼀致
+优
+先
+级
+⼯
+作
+项
+关键字段 关键函数模块 测试⽤例 验收
+标准
+P
+去
+⽔
+⽅
+法
+离
+线
+竞
+赛
+devig_method devig_1x2_power(), 
+devig_1x2_oo_epc_benchmark()
+⻓赔率桶对⽐
+Multiplicative/
+Power/OO-
+EPC
+选出
+每家
+庄家
+或全
+局最
+佳稳
+健基
+线
+P
+⾼
+级
+分
+布
+扩
+展
+nb_dispersion, 
+alt_dependence_modelfit_negative_binomial_variant()
+厚尾赛事集与
+世界杯等赛事
+单独对⽐
+仅在
+OOT
+稳定
+优于
+DC-
+lite
+时保
+留
+13
+
+
+===== PAGE 14 =====
+
+优
+先
+级
+⼯
+作
+项
+关键字段 关键函数模块 测试⽤例 验收
+标准
+P
+可
+选
+xG
+协
+变
+量
+xg_provider, 
+xg_coverage_rate join_prematch_xg_features()coverage 不⾜
+时⾃动降级
+xG
+只做
+辅助
+特
+征，
+不做
+硬依
+赖
+上⾯的执⾏顺序是刻意保守的。P 的⽬标不是“赚更多”，⽽是彻底阻断假阳性 EV 的来源；P 才是把概率审
+批、线别校准和 CLV 审计做完整；P 才去试更前沿的⽅法。近期⽂献⾥确实出现了看起来更强的 odds
+conversion 与 market calibration ⽅法，但在你当前样本量和系统状态下，正确做法是先把可审计的稳健基线
+做完整，再离线竞赛新⽅法。
+需要补充的数据
+⼗⼀、需要我提供或补充的数据清单
+如果你希望下⼀步把这份⽅案直接翻成代码、SQL 和回测脚本，我最需要下⾯这些数据。前四项是必须项，后
+⾯是增强项。
+优
+先
+级
+数据清单 最低要求 ⽤途
+必
+须 原始预测导出
+每条预测的 fixture_id, created_at, market_type, 
+line, side, pbase/qmkt/展⽰概率, entry_odds, 
+selected_bookmaker
+复现当前链路与基
+线
+必
+须
+原始赔率历史
+快照
+⾄少包含 fixture_id, bookmaker, market_type, line, 
+side, odds, fetched_at，最好能按时间序列导出
+重建同庄家盘⼝选
+择与 CLV
+必
+须 已结算赛果表90 分钟主客进球、结算时间、是否同步成功 做精确结算与样本
+准⼊
+必
+须
+当前 pbase
+代码或特征清
+单
+⾄少知道 pbase 来⾃哪些赛前特征、如何映射到⽐分/胜
+平负
+判断是“模型
+错”还是“校准
+错”
+建
+议
+盘⼝命名映射
+表
+API-Football 返回的 market/bet/value 到内部标准
+market_type/line/side 的映射
+防⽌不同盘⼝字符
+串误⼊同⼀桶
+建
+议 收盘赔率快照临近开赛最后⼀次可⽤快照；同庄家同线 正式引⼊ CLV
+建
+议
+缺失率与质量
+⽇志 每场特征覆盖率、赔率完整率、快照时效 建 Q_data
+23
+14
+
+
+===== PAGE 15 =====
+
+优
+先
+级
+数据清单 最低要求 ⽤途
+建
+议 联赛覆盖统计各联赛样本数、盘⼝完整率、庄家分布 建 Q_league
+可
+选
+赛前 xG 或⾼
+阶特征 明确 provider、覆盖率、字段定义 仅⽤于 P 增强实
+验
+可
+选
+当前⻚⾯导出
+⽰例 单场详情、批量结果、复盘报告各⼀份 对⻬⻚⾯审计字段
+⽬前信息⾥最不完整的点，不是模型形式本⾝，⽽是赔率历史粒度、收盘可⽐性、当前 pbase 特征定义、以及
+每条票据的同庄家追溯能⼒。这⼏个对象⼀旦补⻬，P/P 的⼤部分⼯作就可以直接翻成数据库迁移、函数模
+块和回测脚本；如果这些对象补不⻬，那么 CLV、分歧归因和正式审批都会⻓期停留在半⼿⼯状态。你上传的
+项⽬审查报告也已经把“增加收盘赔率字段”“按庄家、联赛、盘⼝类型、盘⼝线保存分层字段”列为下⼀阶
+段重点，这与这⾥的数据清单完全⼀致。ﬁleciteturnﬁle
+https://scikit-learn.org/stable/modules/calibration.html
+https://scikit-learn.org/stable/modules/calibration.html
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://en.wikipedia.org/wiki/Asian_handicap
+https://en.wikipedia.org/wiki/Asian_handicap
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+https://arxiv.org/abs/.
+1 5 6 9 10 17 18 19
+2 7
+3
+4 8 11 22 23
+12
+13
+14
+15 16
+20
+21
+15

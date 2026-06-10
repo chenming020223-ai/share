@@ -11,6 +11,7 @@
 - 模型优化与增强理论研究：`docs/model_optimization_research.md`
 - 模型完整计算公式：`docs/model_formulas.md`
 - 模型吸收规范与正式 EV 准入：`docs/model_adoption_spec_v1.md`
+- 项目不足分析：`docs/project_gap_analysis_2026-05-28.md`
 - 模型审查报告：`docs/model_review_2026-05-22.md`
 - 项目深度报告：`docs/project_deep_review_report_2026-05-22.md`
 - 最终程序成果模拟：`docs/final_product_demo.md`
@@ -20,6 +21,8 @@
 - 甲方确认需求：`docs/client_requirements.md`
 - 故障排查：`docs/troubleshooting.md`
 - 交付说明：`交付说明.md`
+- 最终落地交付报告：`docs/final_delivery_report_2026-06-06.md`
+- 实盘下注系统验证与上线计划：`docs/live_betting_validation_plan.md`
 - 交付更新记录：`docs/release_notes_2026-05-22.md`
 - 公网分享部署说明：`docs/online_sharing_deployment.md`
 
@@ -43,6 +46,12 @@ python3 -m worldcup_predictor --auto --home Brazil --away France
 python3 -m worldcup_predictor --auto --home Brazil --away France --bankroll 1000 --unit 10
 ```
 
+默认单场使用深度模式，会补抓双方近 10 场技术统计与事件数据。临时节省额度时可使用：
+
+```bash
+python3 -m worldcup_predictor --auto --home Brazil --away France --collection-mode fast
+```
+
 输出 JSON：
 
 ```bash
@@ -53,21 +62,23 @@ python3 -m worldcup_predictor --auto --home Brazil --away France --json
 
 项目名：世界杯预测  
 预测口径：90 分钟赛果  
-模拟舱规则：API 模式只使用 Pinnacle 全场盘口；当前仅保留研究试算 EV 供复核，重大模型分歧时暂停展示，待 `pfinal` 经校准和回测验证后再启用正式模拟信号
+模拟舱规则：API 模式按庄家优先级选取全场盘口，默认优先级为 `Pinnacle > Bet365 > Betfair > SBO > 10Bet > 1xBet`；当前仅保留研究试算 EV 供复核，重大模型分歧时暂停展示，待 `pfinal` 经校准和回测验证后再启用正式模拟信号
 
 网页采用真实赛事单入口：搜索或抽取赛前比赛后生成分析，初次打开页面不会自动创建演示预测记录。新版界面为石墨灰玻璃工作台布局，按“预测工作台 / 数据处理 / 模型审计 / 历史报告”组织操作和复核信息。
 
 首次使用先双击 `setup_worldcup_predictor.command` 安装依赖。
 
-最简单启动方式：双击项目根目录里的 `start_worldcup_predictor.command`，程序会自动打开本地网页。
+最简单启动方式：双击项目根目录里的 `start_worldcup_predictor.command`，程序会在后台启动本地服务并自动打开网页。启动成功后可以关闭弹出的终端窗口，网页服务不会因此停止。
 
-启动本地网页：
+停止本地服务：
 
-```bash
-python3 -m worldcup_predictor.web_server
+```text
+stop_worldcup_predictor.command
 ```
 
-然后打开：
+如果网页打不开，优先重新双击 `start_worldcup_predictor.command`。需要查看运行状态时再使用下面的诊断地址：
+
+本地网页：
 
 ```text
 http://127.0.0.1:8765
@@ -76,7 +87,7 @@ http://127.0.0.1:8765
 健康检查：
 
 ```text
-http://127.0.0.1:8765/api/health
+http://127.0.0.1:8765/healthz
 ```
 
 API 连接检查：
@@ -115,22 +126,28 @@ http://127.0.0.1:8765/api/today-fixtures?scope=first_division
 - API-Football 请求遇到临时网络中断、EOF、限流或服务端错误时会自动重试，最终失败会给出中文原因。
 - API 模式会保存原始数据快照和双方最近 10 场中的有效 90 分钟结果，便于后续复盘和回测。
 - 页面“数据处理”板块展示双方近 5–10 场有效样本、场均指标、累计积分曲线与处理步骤；仅有一个赔率快照时明确提示无法形成真实赔率走势。
-- API 模式会将 Pinnacle 全场赔率按 `snapshot_id + market_type + line + selection` 保存为结构化报价，并保存赔率时点、开赛时点与模型版本。
+- 页面默认抓取深度为深度模式，补充近期比赛 xG、射门、射正、控球、红牌和点球；快速模式仅用于额度紧张时临时降级。
+- API 模式会对双方近 10 场有效比赛做对手强度和时间衰减校正；国家队、U21 和友谊赛会额外融合内部球队强度先验，避免短期样本把 `pbase` 拉偏。
+- API 模式会将优先级庄家全场赔率按 `snapshot_id + market_type + line + selection` 保存为结构化报价，并保存实际庄家、赔率时点、开赛时点与模型版本。
 - 页面“模型验收”区域可以点击“同步赛果”，仅为已经存在合格赛前快照的比赛回填 API-Football 90 分钟结果。
 - 人工填写比赛 ID 同样禁止对已开赛比赛生成新的预测快照，避免把赛后信息混入校准数据。
 - 今日随机比赛只抽取赛前比赛；双方任一方少于 5 场有效近期比赛时，模拟舱会降级为观望。
 - 页面“今日甲级联赛”会抓取北京时间当天尚未开赛、中文赛事名属于足球甲级联赛的赛程供选择；选中后再预测，不批量制造无盘口快照。
-- 正式 API 模式的赔率固定使用 `Pinnacle`；胜平负只接受完整全场 1X2，大小球和让球只接受同盘口线的全场成对赔率；半场、卡牌、角球盘口会排除。
-- 报告区分“指定庄家”和“已取得盘口庄家”；未取得 Pinnacle 盘口时三类市场显示缺失且资金占用为零。
-- 当前研究复核门槛：优势不低于 8%，基础 EV 不低于 5%，保守 EV 不低于 3%；胜平负方向基础模型概率低于 40% 时不形成研究方向。
-- 当 API 模式完整 Pinnacle 胜平负盘口中任一方向的 `pbase` 与 `qmkt` 差异超过 15 个百分点时，程序标记整场“模型分歧异常”，胜平负、大小球和让球全部暂停 EV 数值展示；原始试算只写入中文报告审计附录，资金占用为零。
-- 当前概率身份：基础模型为 `pbase`，Pinnacle 去水概率为 `qmkt`；页面的展示融合概率不是 `pfinal`。在 `pshr/pfinal` 完成时间切分校准和回测验证前，API 模式研究方向统一为观望且模拟资金占用为零。
+- 后台批量建库可通过 `python3 -m worldcup_predictor.batch_collect --scope first_division --mode batch` 或 `daily_batch_collect.command` 执行；`install_daily_batch.command` 可安装每天 08:30 自动运行任务。
+- 正式 API 模式的赔率按优先级选取；胜平负只接受同一家完整全场 1X2，大小球和让球只接受同一家、同盘口线的全场成对赔率；半场、卡牌、角球盘口会排除。
+- 报告区分“庄家优先级”和“已取得盘口庄家”；未取得优先级内可用全场盘口时，三类市场显示缺失且资金占用为零。
+- 当前研究复核门槛：优势不低于 8%，基础研究 EV 不低于 5%，纸上 EV 不低于 3%；胜平负方向基础模型概率低于 40% 时不形成研究方向。
+- 大小球和让球当前只开放逐比分结算的 `research_EV` 审计；由于比分分布层尚未完成专项校准，`paper_EV`、`p_adj`、`shrink_k` 和正式 EV 均显示为未开放，不进入模拟资金。
+- 当 API 模式完整胜平负盘口中任一方向的 `pbase` 与当前实际市场基准 `qmkt` 差异超过 15 个百分点时，程序标记整场“模型分歧异常”，胜平负、大小球和让球全部暂停 EV 数值展示；原始试算只写入中文报告审计附录，资金占用为零。
+- 当前概率身份：基础模型为 `pbase`，当前实际市场基准去水概率为 `qmkt`；页面的展示融合概率不是 `pfinal`。在 `pshr/pfinal` 完成时间切分校准和回测验证前，API 模式研究方向统一为观望且模拟资金占用为零。
+- 批量赛事池支持多个 fixture_id 指定分析、批次保存、历史恢复、官方批次标记、筛选搜索和单场钻取。
+- 赛后复盘页支持按日期查看已结算比赛、待结算比赛、EV 候选真实结果，并导出中文 Excel 复盘。
 - 完整字段与准入规则见 `docs/prediction_data_standard_v1.md`。
 
 ## 已支持的维度
 
 - 球队实力：Elo、FIFA 排名、进攻评分、防守评分、阵容厚度、教练评分。
-- 庄家水位：正式 API 模式固定读取 Pinnacle 全场盘口，程序会先做去水，再和模型概率融合。
+- 庄家水位：正式 API 模式按优先级读取全场盘口，程序会先做去水，再和模型概率融合。
 - 小组积分形势：积分、净胜球、必须赢球程度、轮换风险。
 - 历史关系：交锋心理优势、德比/宿敌强度。
 - 国家关系：作为低权重情景变量输入，只表达假设，不代表事实判断。
@@ -208,6 +225,14 @@ python3 -m worldcup_predictor --match-id MEX-USA --market-weight 0.60
 - 基于预测当时保存的 payload 结算模拟舱。
 - 输出 ROI、最大回撤、Brier Score、Log Loss。
 - 将合格赛前样本按时间划分为开发、校准与验证区间，拟合候选 `pshr` 并对照 `pbase`、`qmkt`。
-- 明确排除赛后生成、缺少赔率时点、非 Pinnacle 或重复比赛的样本。
+- 明确排除赛后生成、缺少赔率时点、未取得优先级庄家盘口或重复比赛的样本。
 
-当前真实留档已回填 `236` 条结构化 Pinnacle 报价，并同步 `2` 场合格赛前预测的赛果；样本量不足验收门槛。2026-05-26 对“哈萨克斯坦足球甲级联赛：阿斯塔纳二队 vs 汗腾格里”完成页面真实预测验证（运行 `56`），因未取得 Pinnacle 盘口而正确输出市场缺失、占用 `0` 元，不增加合格校准样本。当前校准审计仅覆盖胜平负概率，大小球与让球仍需单独验证；在 `pfinal` 审批前不能宣称模型已经验证正期望，也不启用 API 正式模拟信号。
+当前真实留档已保存 `173` 条预测、`120` 条 API 快照、`2074` 条结构化报价、`20` 场赛果和 `7` 个批量批次；合格赛前样本为 `15/100`，样本量不足验收门槛。2026-06-03 复盘显示 `24` 场预测中 `15` 场已结算，最高概率方向命中率 `60.0%`，EV 候选已结算等额盈亏 `-1.98`，说明正式 EV 继续关闭是必要的。当前校准审计仅覆盖胜平负概率，大小球与让球仍需单独验证；在 `pfinal` 审批前不能宣称模型已经验证正期望，也不启用 API 正式模拟信号。
+
+最终交付验收：
+
+```bash
+python3 -m worldcup_predictor.delivery --full
+```
+
+也可以双击 `final_delivery_check.command`。验收结果会保存到 `outputs/delivery_audit/`；该结果区分“产品链路可交付”和“真实资金是否可开放”，当前真实资金应保持禁用。

@@ -12,6 +12,8 @@ dependencies = [
 [project.scripts]
 worldcup-predict = "worldcup_predictor.cli:main"
 worldcup-web = "worldcup_predictor.web_server:main"
+worldcup-batch = "worldcup_predictor.batch_collect:main"
+worldcup-delivery-check = "worldcup_predictor.delivery:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

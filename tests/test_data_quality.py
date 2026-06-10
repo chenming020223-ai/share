@@ -76,11 +76,13 @@ class DataQualityTest(unittest.TestCase):
         adjusted, gated_portfolio = apply_quality_gate([recommendation], portfolio, quality, enforce=True)
 
         self.assertEqual(adjusted[0].action, "WATCH")
+        self.assertEqual(adjusted[0].signal_status, "SUSPENDED")
+        self.assertIn("low_data_quality", adjusted[0].risk_flags)
         self.assertEqual(adjusted[0].stake, 0)
         self.assertEqual(gated_portfolio.active_bets, 0)
         self.assertEqual(gated_portfolio.total_stake, 0)
 
-    def test_required_bookmaker_must_be_present(self):
+    def test_bookmaker_priority_must_produce_usable_market(self):
         market = MarketSnapshot(
             required_bookmaker="Pinnacle",
             selected_bookmaker=None,
@@ -95,7 +97,7 @@ class DataQualityTest(unittest.TestCase):
         )
 
         self.assertEqual(report.factors["bookmaker_quality"], 0.0)
-        self.assertTrue(any("未取得指定庄家 Pinnacle" in note for note in report.notes))
+        self.assertTrue(any("未取得庄家优先级内可用全场盘口" in note for note in report.notes))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ class ModelGovernanceTest(unittest.TestCase):
         )
 
         self.assertEqual(adjusted[0].action, "WATCH")
+        self.assertEqual(adjusted[0].signal_status, "RESEARCH_WATCH")
+        self.assertIsNone(adjusted[0].ev_pfinal_exec)
+        self.assertEqual(adjusted[0].ev_layer, "pbase_research")
         self.assertIn("pshr/pfinal", adjusted[0].reason)
         self.assertEqual(adjusted[0].stake, 0)
         self.assertEqual(gated.active_bets, 0)

@@ -8,7 +8,7 @@ from .backtest import actual_result_key, brier_score, log_loss
 from .storage import calibration_source_rows, market_dataset_coverage
 
 OUTCOMES = ("home_win", "draw", "away_win")
-MARKET_DATASET_VERSION = "pinnacle_fulltime_snapshot_v2"
+MARKET_DATASET_VERSION = "priority_bookmaker_fulltime_snapshot_v3"
 PBASE_MODEL_VERSION = "pbase_poisson_recent_form_v1"
 PSHR_MODEL_VERSION = "pshr_market_blend_timesplit_v1"
 
@@ -90,7 +90,7 @@ def build_model_validation_status(
         "checks": checks,
         "excluded": exclusions,
         "notes": [
-            "仅纳入在开赛前生成、具备 Pinnacle 全场赔率时点且已有 90 分钟赛果的真实 API 快照。",
+            "仅纳入在开赛前生成、具备庄家优先级全场赔率时点且已有 90 分钟赛果的真实 API 快照。",
             "pshr 使用校准区间拟合市场收缩权重，验证区间只用于时间外评估。",
             "当前时间切分验收对象为胜平负三分类概率；大小球与让球仍需独立的比分分布校准验收。",
             "即使达到待审批条件，正式 EV 仍保持关闭，须另行确认 pfinal 公式与策略回测。",
@@ -119,8 +119,8 @@ def _eligible_observations(rows: list[dict[str, Any]]) -> tuple[list[Calibration
         prediction_time = _parse_time(row.get("prediction_created_at"))
         captured_time = _parse_time(row.get("odds_captured_at"))
         kickoff_time = _parse_time(row.get("kickoff_at"))
-        bookmaker = str(row.get("selected_bookmaker") or "").casefold()
-        if not prediction_time or not captured_time or not kickoff_time or bookmaker != "pinnacle":
+        bookmaker = str(row.get("selected_bookmaker") or "").strip()
+        if not prediction_time or not captured_time or not kickoff_time or not bookmaker:
             excluded["missing_time_or_bookmaker"] += 1
             continue
         if prediction_time >= kickoff_time or captured_time >= kickoff_time or captured_time > prediction_time:

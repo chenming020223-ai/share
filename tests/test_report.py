@@ -78,17 +78,21 @@ class ReportTest(unittest.TestCase):
         self.assertIn("Second League A", report)
         self.assertNotIn("名称待核定", report)
 
-    def test_report_distinguishes_required_and_received_bookmaker(self):
+    def test_report_distinguishes_priority_and_received_bookmaker(self):
         payload = run_sample_prediction(match_id="MEX-USA", bankroll=1000, unit_stake=10)
         payload["meta"]["requiredBookmaker"] = "Pinnacle"
+        payload["meta"]["bookmakerPriority"] = ["Pinnacle"]
+        payload["meta"]["selectedBookmakers"] = {}
         payload["meta"]["bookmaker"] = "未取得"
         payload["market"]["requiredBookmaker"] = "Pinnacle"
+        payload["market"]["bookmakerPriority"] = ["Pinnacle"]
+        payload["market"]["selectedBookmakers"] = {}
         payload["market"]["selectedBookmaker"] = None
 
         report = build_chinese_report(payload)
 
-        self.assertIn("指定庄家：Pinnacle", report)
-        self.assertIn("已取得盘口庄家：未取得", report)
+        self.assertIn("庄家优先级：Pinnacle", report)
+        self.assertIn("实际盘口庄家：未取得", report)
 
     def test_report_includes_data_processing_audit_when_available(self):
         payload = run_sample_prediction(match_id="MEX-USA", bankroll=1000, unit_stake=10)
@@ -120,7 +124,8 @@ class ReportTest(unittest.TestCase):
 
         self.assertIn("数据处理审计", report)
         self.assertIn("仅保存单次赛前赔率快照", report)
-        self.assertIn("| 墨西哥 | 5 | 2.00 | 1.60 |", report)
+        self.assertIn("| 墨西哥 | 5 |", report)
+        self.assertIn("| 美国 | 5 |", report)
 
     def test_report_hides_suspended_ev_and_keeps_audit_appendix(self):
         payload = run_sample_prediction(match_id="MEX-USA", bankroll=1000, unit_stake=10)

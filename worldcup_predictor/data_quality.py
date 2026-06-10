@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 
-from .betting import BetRecommendation, PaperPortfolio
+from .betting import SIGNAL_STATUS_SUSPENDED, BetRecommendation, PaperPortfolio, recalculate_portfolio
 from .market import MarketSnapshot
 from .models import clamp
 
@@ -55,11 +55,11 @@ def build_data_quality_report(
     available_markets = sum(1 for item in markets if item.status == "available")
     odds_completeness = available_markets / len(markets) if markets else 0.0
     fixture_certainty = 1.0 if str(fixture_id or "").strip() else 0.0
-    if market.required_bookmaker:
+    if market.bookmaker_priority or market.required_bookmaker:
         bookmaker_quality = 1.0 if market.selected_bookmaker else 0.0
     else:
-        bookmaker_quality = clamp(market.bookmakers_count / 8.0, 0.0, 1.0)
-    if sample and market.bookmakers_count > 0:
+        bookmaker_quality = clamp((market.available_bookmakers_count or market.bookmakers_count) / 8.0, 0.0, 1.0)
+    if sample and (market.available_bookmakers_count or market.bookmakers_count) > 0:
         bookmaker_quality = 0.55
 
     factors = {
@@ -80,11 +80,12 @@ def build_data_quality_report(
     )
     score = clamp(score, 0.0, 1.0)
     notes: list[str] = []
-    if market.required_bookmaker and not sample:
+    if (market.bookmaker_priority or market.required_bookmaker) and not sample:
         if market.selected_bookmaker:
-            notes.append(f"赔率来源已限定为指定庄家 {market.selected_bookmaker} 的全场盘口。")
+            notes.append(f"赔率来源已按庄家优先级取得：{_source_summary(market)}。")
         else:
-            notes.append(f"未取得指定庄家 {market.required_bookmaker} 的全场盘口，模拟舱不得产生信号。")
+            priority = " > ".join(market.bookmaker_priority or [str(market.required_bookmaker or "")])
+            notes.append(f"未取得庄家优先级内可用全场盘口（{priority}），模拟舱不得产生信号。")
     if max_score is not None and score > max_score:
         score = clamp(max_score, 0.0, 1.0)
         notes.append("未满足可靠球队强度或近期有效比赛准入条件，模拟舱降级为观望。")
@@ -127,7 +128,7 @@ def apply_quality_gate(
 
     adjusted: list[BetRecommendation] = []
     for item in recommendations:
-        if item.action != "BUY":
+        if item.action not in {"BUY", "PAPER_BUY"}:
             adjusted.append(item)
             continue
         adjusted.append(
@@ -135,6 +136,9 @@ def apply_quality_gate(
                 item,
                 action="WATCH",
                 stake=0.0,
+                signal_status=SIGNAL_STATUS_SUSPENDED,
+                ev_pfinal_exec=None,
+                risk_flags=[*item.risk_flags, "low_data_quality"] if "low_data_quality" not in item.risk_flags else item.risk_flags,
                 reason=(
                     f"{item.reason} 数据质量评分 {quality.score * 100:.1f}% "
                     f"低于门槛 {quality.min_quality * 100:.1f}%，模拟舱降级观望。"
@@ -142,23 +146,7 @@ def apply_quality_gate(
             )
         )
 
-    active = [item for item in adjusted if item.action in {"BUY", "PAPER_BUY"}]
-    total_stake = portfolio.unit_stake * len(active)
-    expected_profit = sum(
-        portfolio.unit_stake * (item.expected_value_per_unit or 0.0)
-        for item in active
-        if item.expected_value_per_unit is not None
-    )
-    gated_portfolio = PaperPortfolio(
-        bankroll=portfolio.bankroll,
-        unit_stake=portfolio.unit_stake,
-        active_bets=len(active),
-        total_stake=total_stake,
-        bankroll_after_stakes=portfolio.bankroll - total_stake,
-        expected_profit=expected_profit,
-        expected_bankroll=portfolio.bankroll + expected_profit,
-    )
-    return adjusted, gated_portfolio
+    return adjusted, recalculate_portfolio(portfolio, adjusted)
 
 
 def _match_winner_status(market: MarketSnapshot) -> MarketAvailability:
@@ -218,4 +206,12 @@ def _match_winner_label(key: str) -> str:
 
 
 def _source_text(market: MarketSnapshot) -> str:
-    return f"{market.selected_bookmaker} " if market.selected_bookmaker else ""
+    source = market.bookmaker_for_market("1X2") or market.selected_bookmaker
+    return f"{source} " if source else ""
+
+
+def _source_summary(market: MarketSnapshot) -> str:
+    if market.selected_bookmakers:
+        labels = {"1X2": "胜平负", "OU": "大小球", "AH": "让球"}
+        return "，".join(f"{labels.get(key, key)}={value}" for key, value in market.selected_bookmakers.items())
+    return market.selected_bookmaker or "未取得"

@@ -5,21 +5,35 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .api_football import ApiFootballClient, ApiTeam
-from .betting import DEFAULT_MIN_EDGE, BetRecommendation, PaperPortfolio, build_recommendations
+from .betting import (
+    DEFAULT_MIN_EDGE,
+    SIGNAL_STATUS_SUSPENDED,
+    BetRecommendation,
+    PaperPortfolio,
+    build_recommendations,
+    recalculate_portfolio,
+)
 from .localization import (
     to_api_name,
     to_beijing_time,
     translate_league_display,
     translate_team_display,
 )
-from .market import DEFAULT_BOOKMAKER, MarketSnapshot, parse_api_football_odds
+from .market import DEFAULT_BOOKMAKER_PRIORITY, MarketSnapshot, parse_api_football_odds
 from .model_governance import ModelGovernance, api_model_governance, apply_formal_ev_gate
 from .models import Fixture, ModelConfig, PredictionResult, TeamProfile, as_float, clamp
 from .predictor import predict_match
 from .poisson import score_matrix
+from .risk import build_match_risk_context
+from .settings import env_int, env_list, env_str
+from .team_strength import blend_profile_with_prior, opponent_strength_elo, team_strength_prior
 
 RECENT_MATCH_FETCH_COUNT = 10
 MIN_VALID_RECENT_MATCHES = 5
+COLLECTION_MODE_FAST = "fast"
+COLLECTION_MODE_DEEP = "deep"
+COLLECTION_MODE_BATCH = "batch"
+SUPPORTED_COLLECTION_MODES = {COLLECTION_MODE_FAST, COLLECTION_MODE_DEEP, COLLECTION_MODE_BATCH}
 
 
 @dataclass(frozen=True)
@@ -43,8 +57,16 @@ class AutoPrediction:
     home_recent_matches: int = 0
     away_recent_matches: int = 0
     h2h_available: bool = False
+    collection_mode: str = COLLECTION_MODE_DEEP
+    deep_stats_available: bool = False
+    deep_stats_matches: int = 0
+    api_logical_requests: int = 0
+    api_http_attempts: int = 0
+    api_cache_hits: int = 0
+    api_cache_misses: int = 0
     data_notes: list[str] = field(default_factory=list)
     raw_snapshot: dict[str, Any] = field(default_factory=dict)
+    risk_context: dict[str, Any] = field(default_factory=dict)
 
 
 def run_auto_prediction(
@@ -57,18 +79,22 @@ def run_auto_prediction(
     unit_stake: float | None = None,
     min_edge: float = DEFAULT_MIN_EDGE,
     force_picks: bool = False,
+    collection_mode: str | None = None,
+    client: ApiFootballClient | None = None,
+    bookmaker_priority: list[str] | tuple[str, ...] | str | None = None,
 ) -> AutoPrediction:
-    client = ApiFootballClient(api_key=api_key)
+    active_mode = _normalize_collection_mode(collection_mode)
+    source = client or ApiFootballClient(api_key=api_key)
     search_home_name = to_api_name("team", home_name)
     search_away_name = to_api_name("team", away_name)
     if fixture_id:
-        fixture_row = client.fixture_by_id(fixture_id)
+        fixture_row = source.fixture_by_id(fixture_id)
         requested_home = ApiTeam(id=0, name=search_home_name or home_name)
         requested_away = ApiTeam(id=0, name=search_away_name or away_name)
     else:
-        requested_home = client.resolve_team(search_home_name)
-        requested_away = client.resolve_team(search_away_name)
-        fixture_row = client.next_head_to_head(requested_home.id, requested_away.id)
+        requested_home = source.resolve_team(search_home_name)
+        requested_away = source.resolve_team(search_away_name)
+        fixture_row = source.next_head_to_head(requested_home.id, requested_away.id)
 
     fixture_meta = fixture_row.get("fixture") or {}
     _validate_pre_match_fixture(fixture_meta)
@@ -95,21 +121,48 @@ def run_auto_prediction(
     season = _optional_int(league_meta.get("season"))
     notes: list[str] = []
 
-    odds_rows = _safe_call(lambda: client.odds(fixture_api_id), notes, "赔率数据不可用")
-    market = parse_api_football_odds(odds_rows or [], required_bookmaker=DEFAULT_BOOKMAKER)
+    odds_rows = _safe_call(lambda: source.odds(fixture_api_id), notes, "赔率数据不可用")
+    priority = normalize_active_bookmaker_priority(bookmaker_priority)
+    market = parse_api_football_odds(odds_rows or [], required_bookmaker=None, bookmaker_priority=priority)
 
     home_recent_rows = _safe_call(
-        lambda: client.team_last_fixtures(actual_home.id, RECENT_MATCH_FETCH_COUNT),
+        lambda: source.team_last_fixtures(actual_home.id, RECENT_MATCH_FETCH_COUNT),
         notes,
         "主队近期比赛不可用",
     ) or []
     away_recent_rows = _safe_call(
-        lambda: client.team_last_fixtures(actual_away.id, RECENT_MATCH_FETCH_COUNT),
+        lambda: source.team_last_fixtures(actual_away.id, RECENT_MATCH_FETCH_COUNT),
         notes,
         "客队近期比赛不可用",
     ) or []
     home_recent = _valid_recent_matches(home_recent_rows, actual_home.id)
     away_recent = _valid_recent_matches(away_recent_rows, actual_away.id)
+    deep_stats_limit = _deep_stats_limit(active_mode)
+    deep_stats_matches = 0
+    if active_mode in {COLLECTION_MODE_DEEP, COLLECTION_MODE_BATCH}:
+        home_recent, home_deep_count = _enrich_recent_matches_with_deep_stats(
+            source,
+            home_recent,
+            actual_home.id,
+            notes,
+            "主队",
+            limit=deep_stats_limit,
+        )
+        away_recent, away_deep_count = _enrich_recent_matches_with_deep_stats(
+            source,
+            away_recent,
+            actual_away.id,
+            notes,
+            "客队",
+            limit=deep_stats_limit,
+        )
+        deep_stats_matches = home_deep_count + away_deep_count
+        notes.append(
+            f"数据抓取模式：{_collection_mode_label(active_mode)}；"
+            f"已尝试补充双方近期比赛技术统计与事件，成功覆盖 {deep_stats_matches} 场。"
+        )
+    else:
+        notes.append("数据抓取模式：快速模式；仅抓比赛、赔率、双方近期赛果、赛季统计和交锋。")
     recent_form_available = (
         len(home_recent) >= MIN_VALID_RECENT_MATCHES
         and len(away_recent) >= MIN_VALID_RECENT_MATCHES
@@ -124,12 +177,12 @@ def run_auto_prediction(
     away_stats = None
     if league_id and season:
         home_stats = _safe_call(
-            lambda: client.team_statistics(league_id, season, actual_home.id),
+            lambda: source.team_statistics(league_id, season, actual_home.id),
             notes,
             "主队赛季统计不可用",
         )
         away_stats = _safe_call(
-            lambda: client.team_statistics(league_id, season, actual_away.id),
+            lambda: source.team_statistics(league_id, season, actual_away.id),
             notes,
             "客队赛季统计不可用",
         )
@@ -137,13 +190,17 @@ def run_auto_prediction(
         notes.append("赛事缺少 league/season，无法拉取球队赛季统计。")
 
     h2h_rows = _safe_call(
-        lambda: client.last_head_to_head(actual_home.id, actual_away.id),
+        lambda: source.last_head_to_head(actual_home.id, actual_away.id),
         notes,
         "历史交锋不可用",
     ) or []
 
-    home_profile = _profile_from_api(actual_home, home_stats, home_recent)
-    away_profile = _profile_from_api(actual_away, away_stats, away_recent)
+    prior_recent_weight = _prior_recent_weight(active_mode, league_meta)
+    home_profile = _profile_from_api(actual_home, home_stats, home_recent, prior_recent_weight=prior_recent_weight)
+    away_profile = _profile_from_api(actual_away, away_stats, away_recent, prior_recent_weight=prior_recent_weight)
+    prior_notes = _team_prior_notes(actual_home.name, actual_away.name, prior_recent_weight)
+    if prior_notes:
+        notes.extend(prior_notes)
     neutral_site = _neutral_site_for_fixture(league_meta)
     notes.append("世界杯正赛按中立场建模。" if neutral_site else "非世界杯正赛按实际主客场建模。")
     fixture = _fixture_from_api(
@@ -156,7 +213,28 @@ def run_auto_prediction(
         notes="; ".join(notes),
     )
 
-    config = ModelConfig(market_weight=clamp(market_weight, 0.0, 0.95))
+    risk_context = build_match_risk_context(
+        home_team=actual_home.name,
+        away_team=actual_away.name,
+        league_name=str(league_meta.get("name") or ""),
+        league_country=str(league_meta.get("country") or ""),
+        collection_mode=active_mode,
+        deep_stats_matches=deep_stats_matches,
+        home_recent_matches=len(home_recent),
+        away_recent_matches=len(away_recent),
+        required_recent_matches=MIN_VALID_RECENT_MATCHES,
+    )
+    if risk_context.get("lambdaShrinkFactor", 1.0) < 1.0:
+        notes.append(
+            "λ 收缩已启用："
+            f"factor={risk_context['lambdaShrinkFactor']:.2f}；"
+            + "、".join(str(item) for item in risk_context.get("lambdaShrinkReasons", []))
+        )
+    config = ModelConfig(
+        market_weight=clamp(market_weight, 0.0, 0.95),
+        lambda_shrink_factor=as_float(risk_context.get("lambdaShrinkFactor"), 1.0),
+        lambda_shrink_reasons=tuple(str(item) for item in risk_context.get("lambdaShrinkReasons", [])),
+    )
     result = predict_match(home_profile, away_profile, fixture, config)
     matrix = score_matrix(result.expected_goals_home, result.expected_goals_away, config.max_goals)
     recommendations, portfolio = build_recommendations(
@@ -167,6 +245,7 @@ def run_auto_prediction(
         unit_stake=unit_stake,
         min_edge=min_edge,
         force_picks=force_picks,
+        risk_context=risk_context,
     )
     team_stats_available = recent_form_available
     if not recent_form_available:
@@ -202,8 +281,22 @@ def run_auto_prediction(
         home_recent_matches=len(home_recent),
         away_recent_matches=len(away_recent),
         h2h_available=bool(h2h_rows),
+        collection_mode=active_mode,
+        deep_stats_available=deep_stats_matches > 0,
+        deep_stats_matches=deep_stats_matches,
+        api_logical_requests=int(getattr(source, "logical_requests", 0) or 0),
+        api_http_attempts=int(getattr(source, "http_attempts", 0) or 0),
+        api_cache_hits=int(getattr(source, "cache_hits", 0) or 0),
+        api_cache_misses=int(getattr(source, "cache_misses", 0) or 0),
         data_notes=notes,
         raw_snapshot={
+            "collection_mode": active_mode,
+            "api_requests": {
+                "logical": int(getattr(source, "logical_requests", 0) or 0),
+                "http_attempts": int(getattr(source, "http_attempts", 0) or 0),
+                "cache_hits": int(getattr(source, "cache_hits", 0) or 0),
+                "cache_misses": int(getattr(source, "cache_misses", 0) or 0),
+            },
             "fixture": fixture_row,
             "odds": odds_rows or [],
             "team_stats": {
@@ -215,27 +308,47 @@ def run_auto_prediction(
                 "away": away_recent,
                 "required_matches": MIN_VALID_RECENT_MATCHES,
                 "requested_matches": RECENT_MATCH_FETCH_COUNT,
+                "deep_stats_matches": deep_stats_matches,
             },
             "h2h": h2h_rows,
             "notes": list(notes),
+            "risk_context": risk_context,
         },
+        risk_context=risk_context,
     )
+
+
+def normalize_active_bookmaker_priority(value: list[str] | tuple[str, ...] | str | None = None) -> list[str]:
+    if value:
+        if isinstance(value, str):
+            configured = [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+        else:
+            configured = [str(item).strip() for item in value if str(item).strip()]
+        return configured or list(DEFAULT_BOOKMAKER_PRIORITY)
+    configured = env_list("WORLDCUP_BOOKMAKER_PRIORITY", DEFAULT_BOOKMAKER_PRIORITY)
+    return configured or list(DEFAULT_BOOKMAKER_PRIORITY)
 
 
 def _profile_from_api(
     team: ApiTeam,
     stats: dict[str, Any] | None,
     recent_matches: list[dict[str, Any]] | None = None,
+    *,
+    prior_recent_weight: float = 0.45,
 ) -> TeamProfile:
     if recent_matches and len(recent_matches) >= MIN_VALID_RECENT_MATCHES:
-        played = float(len(recent_matches))
-        gf_avg = sum(as_float(item.get("goals_for"), 0.0) for item in recent_matches) / played
-        ga_avg = sum(as_float(item.get("goals_against"), 0.0) for item in recent_matches) / played
-        points_per_game = sum(as_float(item.get("points"), 0.0) for item in recent_matches) / played
-        return _build_profile(team, played, gf_avg, ga_avg, points_per_game)
+        played, gf_avg, ga_avg, points_per_game = _weighted_recent_summary(recent_matches)
+        return _build_profile(
+            team,
+            played,
+            gf_avg,
+            ga_avg,
+            points_per_game,
+            prior_recent_weight=prior_recent_weight,
+        )
 
     if not stats:
-        return TeamProfile(name=team.name)
+        return _profile_from_prior_or_default(team)
 
     fixtures = stats.get("fixtures") or {}
     played = as_float((fixtures.get("played") or {}).get("total"), 0.0)
@@ -249,7 +362,14 @@ def _profile_from_api(
     ga_avg = as_float((against_goals.get("average") or {}).get("total"), 1.25)
 
     points_per_game = ((wins * 3.0) + draws) / played if played > 0 else 1.35
-    return _build_profile(team, played, gf_avg, ga_avg, points_per_game)
+    return _build_profile(
+        team,
+        played,
+        gf_avg,
+        ga_avg,
+        points_per_game,
+        prior_recent_weight=min(prior_recent_weight, 0.35),
+    )
 
 
 def _build_profile(
@@ -258,13 +378,18 @@ def _build_profile(
     gf_avg: float,
     ga_avg: float,
     points_per_game: float,
+    *,
+    prior_recent_weight: float = 0.45,
 ) -> TeamProfile:
+    points_per_game = clamp(points_per_game, 0.0, 3.0)
+    gf_avg = clamp(gf_avg, 0.0, 5.0)
+    ga_avg = clamp(ga_avg, 0.0, 5.0)
     elo = 1450.0 + points_per_game * 110.0
     attack = clamp(0.55 + gf_avg / 1.8, 0.65, 1.6)
     defense = clamp(1.55 - ga_avg / 2.2, 0.65, 1.55)
     depth = clamp(0.9 + min(played, 20.0) / 100.0, 0.9, 1.1)
 
-    return TeamProfile(
+    recent_profile = TeamProfile(
         name=team.name,
         elo=elo,
         fifa_rank=80.0,
@@ -273,6 +398,64 @@ def _build_profile(
         squad_depth=depth,
         coach_rating=1.0,
     )
+    return blend_profile_with_prior(recent_profile, team_strength_prior(team.name), recent_weight=prior_recent_weight)
+
+
+def _profile_from_prior_or_default(team: ApiTeam) -> TeamProfile:
+    profile = TeamProfile(name=team.name)
+    return blend_profile_with_prior(profile, team_strength_prior(team.name), recent_weight=0.0)
+
+
+def _weighted_recent_summary(recent_matches: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    weighted_gf = 0.0
+    weighted_ga = 0.0
+    weighted_points = 0.0
+    total_weight = 0.0
+    for index, item in enumerate(recent_matches):
+        recency_weight = 0.92**index
+        opponent_name = str(item.get("opponent") or "")
+        opp_elo = as_float(item.get("opponent_strength_elo"), opponent_strength_elo(opponent_name))
+        attack_context = clamp(opp_elo / 1500.0, 0.65, 1.30)
+        defense_context = clamp(1500.0 / max(opp_elo, 1.0), 0.70, 1.45)
+        points_context = clamp(opp_elo / 1500.0, 0.70, 1.25)
+        goals_for = as_float(item.get("goals_for"), 0.0)
+        goals_against = as_float(item.get("goals_against"), 0.0)
+        points = as_float(item.get("points"), 0.0)
+        weighted_gf += goals_for * attack_context * recency_weight
+        weighted_ga += goals_against * defense_context * recency_weight
+        weighted_points += points * points_context * recency_weight
+        total_weight += recency_weight
+    if total_weight <= 0:
+        return 0.0, 1.25, 1.25, 1.35
+    played = float(len(recent_matches))
+    gf_avg = weighted_gf / total_weight
+    ga_avg = weighted_ga / total_weight
+    points_per_game = weighted_points / total_weight
+    return played, gf_avg, ga_avg, clamp(points_per_game, 0.0, 3.0)
+
+
+def _prior_recent_weight(active_mode: str, league_meta: dict[str, Any]) -> float:
+    league_name = str(league_meta.get("name") or "").casefold()
+    if "friendly" in league_name or "friendlies" in league_name:
+        return 0.15
+    if "u21" in league_name or "u20" in league_name or "u23" in league_name:
+        return 0.25
+    if active_mode == COLLECTION_MODE_FAST:
+        return 0.35
+    return 0.45
+
+
+def _team_prior_notes(home_name: str, away_name: str, recent_weight: float) -> list[str]:
+    notes: list[str] = []
+    for role, name in (("主队", home_name), ("客队", away_name)):
+        prior = team_strength_prior(name)
+        if not prior:
+            continue
+        notes.append(
+            f"{role}应用球队强度先验：{prior.canonical_name}，Elo {prior.elo:.0f}，"
+            f"近期样本权重 {recent_weight:.0%}。"
+        )
+    return notes
 
 
 def _fixture_from_api(
@@ -325,6 +508,7 @@ def _valid_recent_matches(rows: list[dict[str, Any]], team_id: int) -> list[dict
         points = 3 if goals_for > goals_against else 1 if goals_for == goals_against else 0
         opponent = teams.get("away") if is_home else teams.get("home")
         opponent_name = str((opponent or {}).get("name") or "")
+        opponent_prior = team_strength_prior(opponent_name)
         league = row.get("league") or {}
         league_name = str(league.get("name") or "")
         league_country = str(league.get("country") or "")
@@ -340,11 +524,154 @@ def _valid_recent_matches(rows: list[dict[str, Any]], team_id: int) -> list[dict
                 "venue": "home" if is_home else "away",
                 "opponent": opponent_name,
                 "opponent_zh": translate_team_display(opponent_name, "对手"),
+                "opponent_strength_elo": opponent_prior.elo if opponent_prior else 1500.0,
+                "opponent_strength_source": opponent_prior.source if opponent_prior else "unknown_default_1500",
                 "league": league_name,
                 "league_zh": translate_league_display(league_name, league_country),
             }
         )
     return valid
+
+
+def _normalize_collection_mode(value: str | None) -> str:
+    configured = str(value or env_str("WORLDCUP_COLLECTION_MODE", COLLECTION_MODE_DEEP)).strip().casefold()
+    if configured in {"quick", "light"}:
+        configured = COLLECTION_MODE_FAST
+    if configured not in SUPPORTED_COLLECTION_MODES:
+        return COLLECTION_MODE_DEEP
+    return configured
+
+
+def _collection_mode_label(value: str) -> str:
+    return {
+        COLLECTION_MODE_FAST: "快速模式",
+        COLLECTION_MODE_DEEP: "深度模式",
+        COLLECTION_MODE_BATCH: "批量建库模式",
+    }.get(value, value)
+
+
+def _deep_stats_limit(collection_mode: str) -> int:
+    default_limit = RECENT_MATCH_FETCH_COUNT
+    if collection_mode == COLLECTION_MODE_BATCH:
+        default_limit = env_int("WORLDCUP_BATCH_DEEP_MATCH_LIMIT", RECENT_MATCH_FETCH_COUNT)
+    return max(0, min(RECENT_MATCH_FETCH_COUNT, env_int("WORLDCUP_DEEP_MATCH_LIMIT", default_limit)))
+
+
+def _enrich_recent_matches_with_deep_stats(
+    client: ApiFootballClient,
+    rows: list[dict[str, Any]],
+    team_id: int,
+    notes: list[str],
+    role_label: str,
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    enriched: list[dict[str, Any]] = []
+    successful = 0
+    for index, row in enumerate(rows):
+        if index >= limit:
+            enriched.append(row)
+            continue
+        fixture_id = _optional_int(row.get("fixture_id"))
+        if fixture_id is None:
+            enriched.append(row)
+            continue
+        statistics = _safe_call(
+            lambda fixture_id=fixture_id: client.fixture_statistics(fixture_id),
+            notes,
+            f"{role_label}历史比赛 {fixture_id} 技术统计不可用",
+        ) or []
+        events = _safe_call(
+            lambda fixture_id=fixture_id: client.fixture_events(fixture_id),
+            notes,
+            f"{role_label}历史比赛 {fixture_id} 事件数据不可用",
+        ) or []
+        details = _technical_detail_for_team(statistics, events, team_id)
+        successful += 1 if details.get("technical_available") else 0
+        enriched.append({**row, **details})
+    return enriched, successful
+
+
+def _technical_detail_for_team(
+    statistics_rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    team_id: int,
+) -> dict[str, Any]:
+    team_stats = _stats_for_team(statistics_rows, team_id)
+    opponent_stats = _stats_for_opponent(statistics_rows, team_id)
+    red_cards_for = _event_count(events, team_id, event_type="card", detail_contains="red")
+    penalties_for = _event_count(events, team_id, event_type="goal", detail_contains="penalty")
+    return {
+        "xg": _stat_number(team_stats, ("expected goals", "xg", "expected_goals")),
+        "opponent_xga": _stat_number(opponent_stats, ("expected goals", "xg", "expected_goals")),
+        "shots": _stat_number(team_stats, ("total shots", "shots total", "shots")),
+        "shots_on_target": _stat_number(team_stats, ("shots on goal", "shots on target")),
+        "possession_pct": _stat_number(team_stats, ("ball possession", "possession")),
+        "red_cards": red_cards_for,
+        "penalties": penalties_for,
+        "technical_available": bool(team_stats),
+    }
+
+
+def _stats_for_team(rows: list[dict[str, Any]], team_id: int) -> dict[str, Any]:
+    for row in rows:
+        team = row.get("team") or {}
+        if _optional_int(team.get("id")) == team_id:
+            return _stats_dict(row.get("statistics") or [])
+    return {}
+
+
+def _stats_for_opponent(rows: list[dict[str, Any]], team_id: int) -> dict[str, Any]:
+    for row in rows:
+        team = row.get("team") or {}
+        if _optional_int(team.get("id")) != team_id:
+            stats = _stats_dict(row.get("statistics") or [])
+            if stats:
+                return stats
+    return {}
+
+
+def _stats_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    for item in items:
+        key = str(item.get("type") or "").strip().casefold()
+        if key:
+            stats[key] = item.get("value")
+    return stats
+
+
+def _stat_number(stats: dict[str, Any], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        if name.casefold() not in stats:
+            continue
+        value = stats[name.casefold()]
+        if value in {None, ""}:
+            return None
+        text = str(value).replace("%", "").strip()
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _event_count(
+    events: list[dict[str, Any]],
+    team_id: int,
+    *,
+    event_type: str,
+    detail_contains: str,
+) -> int:
+    count = 0
+    for event in events:
+        team = event.get("team") or {}
+        if _optional_int(team.get("id")) != team_id:
+            continue
+        kind = str(event.get("type") or "").casefold()
+        detail = str(event.get("detail") or "").casefold()
+        if event_type in kind and detail_contains in detail:
+            count += 1
+    return count
 
 
 def _neutral_site_for_fixture(league_meta: dict[str, Any]) -> bool:
@@ -418,25 +745,13 @@ def _downgrade_buy_for_missing_strength(
                 item,
                 action="WATCH",
                 stake=0.0,
+                signal_status=SIGNAL_STATUS_SUSPENDED,
+                ev_pfinal_exec=None,
+                risk_flags=[*item.risk_flags, "insufficient_recent_form"] if "insufficient_recent_form" not in item.risk_flags else item.risk_flags,
                 reason=f"{item.reason} 双方近期有效比赛不足最低准入要求，模拟舱降级为观望。",
             )
         )
-    active = [item for item in adjusted if item.action in {"BUY", "PAPER_BUY"}]
-    total_stake = portfolio.unit_stake * len(active)
-    expected_profit = sum(
-        portfolio.unit_stake * (item.expected_value_per_unit or 0.0)
-        for item in active
-        if item.expected_value_per_unit is not None
-    )
-    return adjusted, PaperPortfolio(
-        bankroll=portfolio.bankroll,
-        unit_stake=portfolio.unit_stake,
-        active_bets=len(active),
-        total_stake=total_stake,
-        bankroll_after_stakes=portfolio.bankroll - total_stake,
-        expected_profit=expected_profit,
-        expected_bankroll=portfolio.bankroll + expected_profit,
-    )
+    return adjusted, recalculate_portfolio(portfolio, adjusted)
 
 
 def _optional_int(value: Any) -> int | None:

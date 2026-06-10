@@ -13,7 +13,7 @@
 | A | 客队或球队 B |
 | i | 主队进球数 |
 | j | 客队进球数 |
-| G | 最大枚举进球数，当前默认 G = 8 |
+| G | 最大枚举进球数，当前默认 G = 10 |
 | lambda_H | 主队预期进球 |
 | lambda_A | 客队预期进球 |
 | O_k | 某结果的十进制赔率 |
@@ -54,6 +54,77 @@ draw_rivalry_weight = 0.08
 执行边界：本章产生的基础概率属于 `pbase`；赔率去水概率属于 `qmkt`；当前市场权重融合结果属于 `P_display`。在 `pshr` 与 `pfinal` 经时间切分校准和回测验证前，以下 EV 只能作为候选研究指标，不得触发 API 正式模拟信号。
 
 ### 2.1 球队基础预期进球
+
+API 模式下，球队画像先经过输入层校正，再进入预期进球公式。输入层不使用市场赔率，避免把 `qmkt` 提前泄漏进 `pbase`。
+
+#### 2.1.1 近期比赛对手强度校正
+
+双方最近 10 场有效 90 分钟比赛按时间衰减加权，越新的比赛权重越高：
+
+```text
+w_t = 0.92 ^ t
+```
+
+其中 `t = 0` 表示最近一场。每场比赛同时按对手强度校正：
+
+```text
+attack_context_t  = clamp(opponent_elo_t / 1500, 0.65, 1.30)
+defense_context_t = clamp(1500 / opponent_elo_t, 0.70, 1.45)
+points_context_t  = clamp(opponent_elo_t / 1500, 0.70, 1.25)
+```
+
+校正后的近期特征：
+
+```text
+GF_adj =
+  sum(goals_for_t * attack_context_t * w_t) / sum(w_t)
+
+GA_adj =
+  sum(goals_against_t * defense_context_t * w_t) / sum(w_t)
+
+PPG_adj =
+  clamp(sum(points_t * points_context_t * w_t) / sum(w_t), 0, 3)
+```
+
+解释：
+
+- 对强队进球更有价值，对弱队刷进球会降权。
+- 被强队进球惩罚较小，被弱队进球惩罚更大。
+- 击败弱队的积分收益会降权，面对强队拿分会升权。
+
+#### 2.1.2 球队强度先验融合
+
+对国家队、U21 等 API 难以通过短期样本准确估计强弱的球队，程序使用内部球队强度先验作为底座。先验包括 `elo_prior`、`rank_prior`、`attack_prior`、`defense_prior`。它不是市场概率，也不直接产生 EV，只用于防止 `pbase` 被短期样本带偏。
+
+先由校正后的近期数据生成近期画像：
+
+```text
+elo_recent     = 1450 + PPG_adj * 110
+attack_recent  = clamp(0.55 + GF_adj / 1.8, 0.65, 1.60)
+defense_recent = clamp(1.55 - GA_adj / 2.2, 0.65, 1.55)
+```
+
+再与强度先验融合：
+
+```text
+elo      = recent_weight * elo_recent + (1 - recent_weight) * elo_prior
+attack   = recent_weight * attack_recent + (1 - recent_weight) * attack_prior
+defense  = recent_weight * defense_recent + (1 - recent_weight) * defense_prior
+rank     = rank_prior
+```
+
+当前 `recent_weight`：
+
+```text
+友谊赛 = 0.15
+U21 / U20 / U23 赛事 = 0.25
+快速模式 = 0.35
+深度或批量模式 = 0.45
+```
+
+没有先验的球队继续使用校正后的近期画像。没有近期样本且存在先验时，使用先验画像；两者都缺失时才回退到默认 `TeamProfile`，并由数据质量闸门限制模拟舱。
+
+#### 2.1.3 预期进球基础项
 
 当前先用双方攻防评分生成基础预期进球：
 
@@ -345,13 +416,35 @@ stake = unit_stake
 如果未输入：
 
 ```text
-stake = bankroll * 0.01
+if bankroll >= starting_bankroll:
+  available_for_unit = starting_bankroll + (bankroll - starting_bankroll) * profit_reinvest_rate
+else:
+  available_for_unit = bankroll
+
+stake = available_for_unit / parts
 ```
 
 边界：
 
 ```text
 stake = clamp(stake, 0, bankroll)
+stake <= bankroll * max_match_exposure_rate
+```
+
+当前默认：
+
+```text
+starting_bankroll = 1000
+parts = 5
+profit_reinvest_rate = 0.50
+max_match_exposure_rate = 0.40
+```
+
+若同一场多个市场同时成为候选，模拟舱会按单场总暴露上限等比例压缩单注：
+
+```text
+if stake * active_bets > bankroll * max_match_exposure_rate:
+  stake_per_bet = bankroll * max_match_exposure_rate / active_bets
 ```
 
 ### 3.2 胜平负 EV
@@ -365,6 +458,10 @@ pbase(k) = P_model(k)
 research_EV_k = pbase(k) * O_k - 1
 candidate_edge_k = pbase(k) - qmkt(k)
 break_even_probability_k = 1 / O_k
+break_even_odds_k = 1 / pbase(k)
+win_stake_fraction_k = pbase(k)
+loss_stake_fraction_k = 1 - pbase(k)
+research_EV_k = win_stake_fraction_k * (O_k - 1) - loss_stake_fraction_k
 ```
 
 当前增加保守概率折扣，默认 `probability_discount = 0.05`：
@@ -406,13 +503,13 @@ min_1x2_probability = 0.40
 WATCH
 ```
 
-解释：胜平负是三项市场，模型胜率低于 50% 理论上可能存在赔率价值；但在未完成大样本回测前，当前交付版本对胜平负增加 40% 下限。若完整 Pinnacle 胜平负盘口的任一方向出现 `abs(pbase - qmkt) > 0.15`，系统将整场比分分布标记为“模型分歧异常”，胜平负、大小球和让球的 EV 展示全部暂停，避免把同一偏差扩散为多条机会。
+解释：胜平负是三项市场，模型胜率低于 50% 理论上可能存在赔率价值；但在未完成大样本回测前，当前交付版本对胜平负增加 40% 下限。若完整优先庄家胜平负盘口的任一方向出现 `abs(pbase - qmkt) > 0.15`，系统将整场比分分布标记为“模型分歧异常”，胜平负、大小球和让球的 EV 展示全部暂停，避免把同一偏差扩散为多条机会。
 
 ### 3.2.1 两项盘口有效性校验
 
 胜平负、大小球、让球必须先通过盘口有效性校验，才允许参与 EV 计算。
 
-正式 API 模式固定使用 `Pinnacle`。胜平负必须来自该庄家同一个全场市场的完整三项赔率：
+正式 API 模式使用庄家优先级，默认 `Pinnacle > Bet365 > Betfair > SBO > 10Bet > 1xBet`。胜平负必须来自同一个优先庄家的同一个全场市场完整三项赔率：
 
 ```text
 valid_1x2(bookmaker) =
@@ -421,7 +518,7 @@ valid_1x2(bookmaker) =
   and away_win_odds exists
 ```
 
-大小球和让球必须来自 `Pinnacle` 同一个全场市场、同一盘口线的成对赔率：
+大小球和让球必须来自同一个优先庄家的同一个全场市场、同一盘口线的成对赔率：
 
 ```text
 valid_pair(line) =
@@ -514,14 +611,34 @@ research_EV_total(side) =
   sum P_score(i, j) * net_total(i, j, side)
 ```
 
+为避免亚洲盘 EV 黑箱化，程序同时输出：
+
+```text
+win_stake_fraction_total =
+  sum P_score(i, j) * win_fraction(i, j, side)
+
+loss_stake_fraction_total =
+  sum P_score(i, j) * loss_fraction(i, j, side)
+
+research_EV_total(side) =
+  win_stake_fraction_total * (O_side - 1) - loss_stake_fraction_total
+
+break_even_odds_total =
+  1 + loss_stake_fraction_total / win_stake_fraction_total
+```
+
+并展示全赢、半赢、走水、半输、全输的比分矩阵概率。
+
 研究方向筛选条件：
 
 ```text
 valid_two_way_market(line)
 and research_EV_total(side*) >= min_ev
 and [P_positive_total(side*) - P_market(side*)] >= min_edge
-and conservative_research_EV_total(side*) > 0
+and score_distribution_validation_status = approved
 ```
+
+当前交付版本中，`score_distribution_validation_status` 尚未批准，因此大小球只输出 `research_EV_total` 和逐比分结算审计；`paper_EV`、`p_adj`、`shrink_k` 与 `formal_EV` 均显示为未开放，不进入模拟资金。
 
 ### 3.4 让球亚洲盘结算
 
@@ -560,14 +677,34 @@ research_EV_handicap(side) =
   sum P_score(i, j) * net_handicap(i, j, side)
 ```
 
+程序同步输出：
+
+```text
+win_stake_fraction_handicap =
+  sum P_score(i, j) * win_fraction(i, j, side)
+
+loss_stake_fraction_handicap =
+  sum P_score(i, j) * loss_fraction(i, j, side)
+
+research_EV_handicap(side) =
+  win_stake_fraction_handicap * (O_side - 1) - loss_stake_fraction_handicap
+
+break_even_odds_handicap =
+  1 + loss_stake_fraction_handicap / win_stake_fraction_handicap
+```
+
+并展示全赢、半赢、走水、半输、全输的比分矩阵概率。
+
 研究方向筛选条件：
 
 ```text
 valid_two_way_market(line)
 and research_EV_handicap(side*) >= min_ev
 and [P_positive_handicap(side*) - P_market(side*)] >= min_edge
-and conservative_research_EV_handicap(side*) > 0
+and score_distribution_validation_status = approved
 ```
+
+当前交付版本中，让球同样只输出 `research_EV_handicap` 和逐比分结算审计；由于比分分布层与盘口线表现尚未完成独立回测，`paper_EV`、`p_adj`、`shrink_k` 与 `formal_EV` 均不开放。
 
 ### 3.5 模拟舱资金
 
@@ -582,7 +719,7 @@ active_bets = count(action = FORMAL_SIGNAL)
 总占用：
 
 ```text
-total_stake = stake * active_bets
+total_stake = sum(stake_i for active recommendations)
 ```
 
 期望收益：

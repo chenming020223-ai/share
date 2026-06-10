@@ -43,6 +43,25 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.casefold() in {"1", "true", "yes", "y", "on", "是"}
 
 
+def env_list(name: str, default: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    value = env_str(name, "")
+    if not value:
+        return list(default or [])
+    parts = value.replace(";", ",").split(",")
+    items: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        item = part.strip()
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+    return items
+
+
 def default_db_path() -> Path:
     configured = env_str("WORLDCUP_DB_PATH", "storage/worldcup_predictor.sqlite3")
     path = Path(configured)
