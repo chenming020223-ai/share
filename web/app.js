@@ -1,5 +1,6 @@
 const DEFAULT_BATCH_LIMIT = 10;
 const MAX_BATCH_LIMIT = 30;
+const BATCH_REQUEST_CHUNK_SIZE = 5;
 
 const state = {
   currentRunId: null,
@@ -195,6 +196,11 @@ batchToday.addEventListener("click", async () => {
   formError.textContent = "";
   const fixtureIds = parseFixtureIds(batchFixtureIds.value);
   const batchLimit = syncBatchLimitValue();
+  const basePayload = {
+    ...buildPayload(),
+    scope: "first_division",
+    collectionMode: "batch",
+  };
   batchToday.disabled = true;
   batchToday.textContent = "批量中";
   fixtureResults.innerHTML = `<div class="fixture-empty">${
@@ -203,19 +209,7 @@ batchToday.addEventListener("click", async () => {
       : `批量中：今日前 ${batchLimit} 场...`
   }</div>`;
   try {
-    const response = await fetch("/api/batch-predict", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        ...buildPayload(),
-        scope: "first_division",
-        limit: fixtureIds.length || batchLimit,
-        fixtureIds,
-        collectionMode: "batch",
-      }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw responseError(data, "批量分析失败");
+    const data = await runBatchPrediction(basePayload, fixtureIds, batchLimit);
     renderBatchResult(data);
     setActiveView("batchView");
     loadHealth();
@@ -235,6 +229,156 @@ batchCount.addEventListener("change", () => {
   updateBatchButtonLabel();
 });
 batchFixtureIds.addEventListener("input", updateBatchButtonLabel);
+
+async function runBatchPrediction(basePayload, fixtureIds, batchLimit) {
+  let targetFixtureIds = fixtureIds;
+  if (!targetFixtureIds.length && batchLimit > BATCH_REQUEST_CHUNK_SIZE) {
+    targetFixtureIds = await resolveTodayBatchFixtureIds(basePayload, batchLimit);
+  }
+  if (targetFixtureIds.length > BATCH_REQUEST_CHUNK_SIZE) {
+    const chunks = chunkArray(targetFixtureIds, BATCH_REQUEST_CHUNK_SIZE);
+    const results = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      fixtureResults.innerHTML = `<div class="fixture-empty">批量中：第 ${index + 1}/${chunks.length} 批，${chunk.length} 场...</div>`;
+      results.push(await postBatchPrediction({
+        ...basePayload,
+        limit: chunk.length,
+        fixtureIds: chunk,
+      }));
+    }
+    return mergeBatchPredictionResults(results, targetFixtureIds.length, targetFixtureIds, basePayload);
+  }
+  return postBatchPrediction({
+    ...basePayload,
+    limit: targetFixtureIds.length || batchLimit,
+    fixtureIds: targetFixtureIds,
+  });
+}
+
+async function resolveTodayBatchFixtureIds(basePayload, batchLimit) {
+  const response = await fetch("/api/today-fixtures", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      scope: "first_division",
+      apiKey: basePayload.apiKey || "",
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw responseError(data, "抓取今日批量比赛失败");
+  return (data.fixtures || [])
+    .map((item) => String(item.fixtureId || "").trim())
+    .filter((fixtureId) => /^\d+$/.test(fixtureId))
+    .slice(0, batchLimit);
+}
+
+async function postBatchPrediction(payload) {
+  const response = await fetch("/api/batch-predict", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok) throw responseError(data, "批量分析失败");
+  return data;
+}
+
+function mergeBatchPredictionResults(results, requestedCount, fixtureIds, basePayload) {
+  const collected = results.flatMap((item) => item.collected || []);
+  const failed = results.flatMap((item) => item.failed || []);
+  const bankroll = Number(basePayload.bankroll || 1000);
+  const totalStake = sumNumbers(collected.map((item) => item.totalStake));
+  const expectedProfit = sumNumbers(collected.map((item) => item.expectedProfit));
+  const active = collected.filter(isBatchPaperBuyItem);
+  const watch = collected.filter((item) => ["RESEARCH_WATCH", "MODEL_CANDIDATE"].includes(item.signalStatus));
+  const noMarket = collected.filter((item) => item.signalStatus === "NO_MARKET" || item.recommendationAction === "NO_MARKET");
+  const plan = buildMergedBatchPortfolioPlan(collected, bankroll);
+  return {
+    date: results[0]?.date || "",
+    scope: results[0]?.scope || "first_division",
+    limit: requestedCount,
+    requestedCount,
+    fixtureIds,
+    candidateFixtures: collected.length + failed.length,
+    collectedCount: collected.length,
+    failedCount: failed.length,
+    batchRunId: results.map((item) => item.batchRunId).filter(Boolean).join("+"),
+    batchSummary: {
+      total: Math.max(requestedCount, collected.length + failed.length),
+      success: collected.length,
+      failed: failed.length,
+      signalCount: active.length,
+      watchCount: watch.length,
+      noMarketCount: noMarket.length,
+      highQualityCount: collected.filter((item) => Number(item.qualityScore || 0) >= 0.75).length,
+      totalStake,
+      expectedProfit,
+      expectedBankroll: bankroll + expectedProfit,
+      bankrollMode: "批量分段请求后合并展示，单场算法与原批量分析一致。",
+      portfolioPlan: plan,
+    },
+    collected,
+    failed,
+    apiRequests: mergeApiRequestStats(results),
+    message: `批量分析完成：请求 ${requestedCount} 场，成功 ${collected.length} 场，失败 ${failed.length} 场。`,
+  };
+}
+
+function buildMergedBatchPortfolioPlan(collected, bankroll) {
+  const candidates = collected.filter((item) => isBatchPaperBuyItem(item) && Number(item.totalStake || 0) > 0);
+  const stakeCap = Math.max(0, bankroll * 0.5);
+  let usedStake = 0;
+  const selected = [];
+  sortBatchItems(candidates, "priority").forEach((item) => {
+    const stake = Number(item.totalStake || 0);
+    if (stakeCap && usedStake + stake > stakeCap) return;
+    usedStake += stake;
+    selected.push(item);
+  });
+  const expectedProfit = sumNumbers(selected.map((item) => item.expectedProfit));
+  const warnings = [];
+  if (candidates.length !== selected.length) {
+    warnings.push(`候选 ${candidates.length} 场中纳入 ${selected.length} 场，避免单批资金占用超过 50%。`);
+  }
+  if (!selected.length) warnings.push("本批次暂无通过研究信号和资金占用条件的组合候选。");
+  return {
+    mode: "研究组合预案",
+    policy: "候选按推荐优先、质量、纸上 EV 排序；正式 EV 未开放时不产生资金占用。",
+    candidateCount: candidates.length,
+    selectedCount: selected.length,
+    stakeCap,
+    plannedStake: usedStake,
+    remainingStakeCap: Math.max(0, stakeCap - usedStake),
+    expectedProfit,
+    expectedBankroll: bankroll + expectedProfit,
+    selectedRunIds: selected.map((item) => item.runId),
+    warnings,
+  };
+}
+
+function mergeApiRequestStats(results) {
+  return {
+    logical: sumNumbers(results.map((item) => item.apiRequests?.logical)),
+    httpAttempts: sumNumbers(results.map((item) => item.apiRequests?.httpAttempts)),
+    cacheHits: sumNumbers(results.map((item) => item.apiRequests?.cacheHits)),
+    cacheMisses: sumNumbers(results.map((item) => item.apiRequests?.cacheMisses)),
+  };
+}
+
+function isBatchPaperBuyItem(item) {
+  return (item.signalStatus || item.recommendationAction) === "PAPER_BUY";
+}
+
+function sumNumbers(values) {
+  return values.reduce((total, value) => total + (Number.isFinite(Number(value)) ? Number(value) : 0), 0);
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) chunks.push(items.slice(index, index + size));
+  return chunks;
+}
 
 syncResults.addEventListener("click", async () => {
   const originalText = syncResults.textContent;
