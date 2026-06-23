@@ -1,7 +1,7 @@
 import math
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from worldcup_predictor.backtest import (
@@ -10,6 +10,7 @@ from worldcup_predictor.backtest import (
     max_drawdown,
     performance_metrics,
     settle_prediction_payload,
+    sync_completed_paper_ledger_results,
 )
 from worldcup_predictor.betting import BetRecommendation, PaperPortfolio, build_recommendations
 from worldcup_predictor.auto_predict import (
@@ -36,8 +37,11 @@ from worldcup_predictor.storage import (
     connect,
     get_api_snapshot,
     market_quotes_for_snapshot,
+    odds_movement_coverage,
+    pending_paper_ledger_result_fixtures,
     recent_predictions,
     record_api_snapshot,
+    record_odds_movement_snapshot,
     record_batch_prediction,
     record_match_result,
     record_prediction,
@@ -132,6 +136,119 @@ class DeepFixtureClient:
         ]
 
 
+class CompletedFixtureClient:
+    def __init__(self):
+        self.requested: list[int] = []
+
+    def fixture_by_id(self, fixture_id):
+        self.requested.append(int(fixture_id))
+        return {
+            "fixture": {"id": fixture_id, "status": {"short": "FT"}},
+            "score": {"fulltime": {"home": 1, "away": 0}},
+        }
+
+
+class HistoricalFixtureClient:
+    def __init__(self):
+        self.logical_requests = 0
+        self.http_attempts = 0
+        self.team_statistics_calls = 0
+
+    def _count(self):
+        self.logical_requests += 1
+        self.http_attempts += 1
+
+    def fixture_by_id(self, fixture_id):
+        self._count()
+        return {
+            "fixture": {
+                "id": fixture_id,
+                "date": "2022-11-25T16:00:00+00:00",
+                "status": {"short": "FT"},
+                "venue": {"name": "World Cup Stadium", "city": "Doha"},
+            },
+            "league": {"id": 1, "season": 2022, "name": "World Cup", "country": "World"},
+            "teams": {
+                "home": {"id": 10, "name": "Historical Home", "winner": True},
+                "away": {"id": 20, "name": "Historical Away", "winner": False},
+            },
+            "goals": {"home": 3, "away": 0},
+            "score": {"fulltime": {"home": 3, "away": 0}},
+        }
+
+    def odds(self, fixture_id):
+        self._count()
+        return [
+            self._odds_row(fixture_id, "2022-11-25T15:30:00+00:00", "2.20", "3.20", "3.50"),
+            self._odds_row(fixture_id, "2022-11-25T17:00:00+00:00", "1.10", "9.00", "20.00"),
+        ]
+
+    def _odds_row(self, fixture_id, updated_at, home, draw, away):
+        return {
+            "fixture": {"id": fixture_id},
+            "update": updated_at,
+            "bookmakers": [
+                {
+                    "name": "Pinnacle",
+                    "bets": [
+                        {
+                            "name": "Match Winner",
+                            "values": [
+                                {"value": "Home", "odd": home},
+                                {"value": "Draw", "odd": draw},
+                                {"value": "Away", "odd": away},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def team_finished_fixtures_until(self, team_id, to_date, limit=30, timezone="Asia/Shanghai"):
+        self._count()
+        return [
+            self._recent_row(team_id, 9000 + team_id, "2022-11-26T12:00:00+00:00", 5, 0),
+            *[
+                self._recent_row(team_id, team_id * 100 + index, f"2022-11-{10 + index:02d}T12:00:00+00:00", 2, 1)
+                for index in range(5)
+            ],
+        ]
+
+    def team_last_fixtures(self, team_id, limit, timezone="Asia/Shanghai"):
+        raise AssertionError("historical mode must prefer cutoff-aware fixture fetching")
+
+    def team_statistics(self, league_id, season, team_id):
+        self.team_statistics_calls += 1
+        raise AssertionError("historical mode must not use full-season aggregate statistics")
+
+    def last_head_to_head(self, team_a_id, team_b_id, limit=10):
+        self._count()
+        return [
+            {
+                "fixture": {"id": 7001, "date": "2023-01-01T12:00:00+00:00"},
+                "teams": {"home": {"id": team_a_id}, "away": {"id": team_b_id}},
+                "goals": {"home": 9, "away": 0},
+            },
+            {
+                "fixture": {"id": 7002, "date": "2021-01-01T12:00:00+00:00"},
+                "teams": {"home": {"id": team_a_id}, "away": {"id": team_b_id}},
+                "goals": {"home": 1, "away": 1},
+            },
+        ]
+
+    def _recent_row(self, team_id, fixture_id, date, goals_for, goals_against):
+        opponent_id = 30 if team_id == 10 else 40
+        return {
+            "fixture": {"id": fixture_id, "status": {"short": "FT"}, "date": date},
+            "league": {"name": "Friendly", "country": "World"},
+            "teams": {
+                "home": {"id": team_id, "name": "Historical Home" if team_id == 10 else "Historical Away"},
+                "away": {"id": opponent_id, "name": "Historical Opponent"},
+            },
+            "score": {"fulltime": {"home": goals_for, "away": goals_against}},
+        }
+
+
 class SafetyAndBacktestTest(unittest.TestCase):
     def test_deep_mode_enriches_recent_matches_with_fixture_statistics(self):
         client = DeepFixtureClient()
@@ -218,6 +335,36 @@ class SafetyAndBacktestTest(unittest.TestCase):
                 now=now,
             )
 
+    def test_historical_asof_prediction_filters_future_data(self):
+        client = HistoricalFixtureClient()
+
+        result = run_auto_prediction(
+            "Historical Home",
+            "Historical Away",
+            fixture_id=20221125,
+            collection_mode="fast",
+            client=client,
+            historical_as_of="",
+        )
+
+        self.assertTrue(result.historical_mode)
+        self.assertEqual(result.raw_snapshot["historical_as_of"], "2022-11-25T15:59:00+00:00")
+        self.assertEqual(client.team_statistics_calls, 0)
+        self.assertEqual(result.market.captured_at, "2022-11-25T15:30:00+00:00")
+        self.assertEqual(result.market.match_winner["home_win"], 2.20)
+        self.assertNotIn("goals", result.raw_snapshot["fixture"])
+        self.assertNotIn("score", result.raw_snapshot["fixture"])
+        self.assertNotIn("winner", result.raw_snapshot["fixture"]["teams"]["home"])
+        self.assertTrue(result.raw_snapshot["fixture"]["fixture"]["historical_asof_sanitized"])
+        home_recent_ids = {item["fixture_id"] for item in result.raw_snapshot["recent_form"]["home"]}
+        away_recent_ids = {item["fixture_id"] for item in result.raw_snapshot["recent_form"]["away"]}
+        self.assertNotIn(9010, home_recent_ids)
+        self.assertNotIn(9020, away_recent_ids)
+        self.assertEqual(len(home_recent_ids), 5)
+        self.assertEqual(len(away_recent_ids), 5)
+        self.assertEqual([item["fixture"]["id"] for item in result.raw_snapshot["h2h"]], [7002])
+        self.assertIn("不进入正式赛前快照", " ".join(result.data_notes))
+
     def test_random_today_filter_allows_only_future_pre_match_fixtures(self):
         now = datetime(2026, 5, 22, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         future = (now + timedelta(hours=2)).isoformat()
@@ -303,7 +450,10 @@ class SafetyAndBacktestTest(unittest.TestCase):
                     {
                         "fixture": {"id": 1, "date": "2026-05-26T20:00:00+08:00", "status": {"short": "NS"}},
                         "league": {"name": "1. Division", "country": "Kazakhstan"},
-                        "teams": {"home": {"name": "Astana II"}, "away": {"name": "Khan Tengri"}},
+                        "teams": {
+                            "home": {"name": "Astana II", "logo": "https://media.api-sports.io/football/teams/10.png"},
+                            "away": {"name": "Khan Tengri", "logo": "https://media.api-sports.io/football/teams/20.png"},
+                        },
                     },
                     {
                         "fixture": {"id": 2, "date": "2026-05-26T21:00:00+08:00", "status": {"short": "NS"}},
@@ -317,6 +467,8 @@ class SafetyAndBacktestTest(unittest.TestCase):
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["fixtures"][0]["leagueZh"], "哈萨克斯坦足球甲级联赛")
         self.assertEqual(result["fixtures"][0]["homeZh"], "阿斯塔纳二队")
+        self.assertEqual(result["fixtures"][0]["homeLogo"], "https://media.api-sports.io/football/teams/10.png")
+        self.assertEqual(result["fixtures"][0]["awayLogo"], "https://media.api-sports.io/football/teams/20.png")
 
     def test_match_result_preserves_away_win_score(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -456,6 +608,41 @@ class SafetyAndBacktestTest(unittest.TestCase):
             self.assertEqual(len(quotes), 7)
             self.assertTrue(all(item["bookmaker"] == "Pinnacle" for item in quotes))
             self.assertTrue(any(item["selection_key"] == "321:FT:1X2:-:home_win" for item in quotes))
+
+    def test_odds_movement_snapshot_records_only_pre_match_quotes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/runs.sqlite3"
+            market = MarketSnapshot(
+                fixture_id=654,
+                required_bookmaker="Pinnacle",
+                selected_bookmaker="Pinnacle",
+                captured_at="2026-06-01T06:00:00+00:00",
+                match_winner={"home_win": 2.0, "draw": 3.2, "away_win": 3.8},
+                totals={2.5: {"over": 1.91, "under": 1.95}},
+                handicaps={-0.5: {"home": 2.05, "away": 1.85}},
+            )
+
+            stored = record_odds_movement_snapshot(
+                fixture_id=654,
+                fixture={"fixture": {"id": 654, "date": "2099-06-01T12:00:00+00:00"}},
+                odds=[],
+                market=market,
+                db_path=db_path,
+            )
+            late = record_odds_movement_snapshot(
+                fixture_id=654,
+                fixture={"fixture": {"id": 654, "date": "2000-01-01T12:00:00+00:00"}},
+                odds=[],
+                market=market,
+                db_path=db_path,
+            )
+            coverage = odds_movement_coverage(db_path=db_path)
+
+            self.assertEqual(stored["inserted"], 7)
+            self.assertTrue(stored["preMatch"])
+            self.assertFalse(late["preMatch"])
+            self.assertEqual(coverage["odds_snapshots"], 7)
+            self.assertEqual(coverage["closing_candidates"], 7)
 
     def test_backtest_probability_metrics_are_correct(self):
         probabilities = {"home_win": 0.7, "draw": 0.2, "away_win": 0.1}
@@ -688,6 +875,93 @@ class SafetyAndBacktestTest(unittest.TestCase):
             self.assertAlmostEqual(timeline["summary"]["realizedPnl"], 100.0)
             self.assertAlmostEqual(timeline["summary"]["cash"], 1100.0)
             self.assertEqual([event["eventType"] for event in timeline["events"]], ["RESERVE", "SETTLE"])
+
+    def test_due_paper_ledger_results_sync_and_settle_without_waiting_for_daily_close(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/runs.sqlite3"
+            due_fixture = "300"
+            future_fixture = "301"
+            for fixture_id, kickoff in (
+                (due_fixture, "2099-06-01T12:00:00+00:00"),
+                (future_fixture, "2101-06-01T12:00:00+00:00"),
+            ):
+                market = MarketSnapshot(
+                    fixture_id=fixture_id,
+                    required_bookmaker="Pinnacle",
+                    selected_bookmaker="Pinnacle",
+                    captured_at="2099-05-31T12:00:00+00:00",
+                    match_winner={"home_win": 2.0, "draw": 3.2, "away_win": 3.8},
+                )
+                snapshot_id = record_api_snapshot(
+                    fixture_id=fixture_id,
+                    home_team="A",
+                    away_team="B",
+                    source="API-Football",
+                    fixture={"fixture": {"id": fixture_id, "date": kickoff}},
+                    odds=[],
+                    team_stats={},
+                    h2h=[],
+                    market=market,
+                    kickoff_at=kickoff,
+                    model_version="pbase_test",
+                    db_path=db_path,
+                )
+                record_prediction(
+                    {
+                        "mode": "auto",
+                        "snapshotId": snapshot_id,
+                        "match": {"id": fixture_id, "home": "A", "away": "B"},
+                        "market": {"selectedBookmakers": {"1X2": "Pinnacle"}},
+                        "portfolio": {
+                            "bankroll": 1000,
+                            "unit_stake": 100,
+                            "active_bets": 1,
+                            "total_stake": 100,
+                            "expected_profit": 15,
+                        },
+                        "recommendations": [
+                            {
+                                "market": "胜平负",
+                                "selection": "A 胜",
+                                "odds": 2.0,
+                                "model_probability": 0.58,
+                                "market_probability": 0.5,
+                                "expected_value_per_unit": 0.16,
+                                "stake": 100,
+                                "action": "PAPER_BUY",
+                                "signal_status": "PAPER_BUY",
+                                "reason": "测试纸上买入",
+                            }
+                        ],
+                    },
+                    db_path=db_path,
+                )
+
+            now = datetime(2100, 1, 1, tzinfo=timezone.utc)
+            client = CompletedFixtureClient()
+
+            pending = pending_paper_ledger_result_fixtures(db_path=db_path, now=now)
+            sync_result = sync_completed_paper_ledger_results(client=client, db_path=db_path, now=now)
+            settle_result = settle_open_paper_ledger(db_path=db_path)
+
+            with connect(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT fixture_id, status, profit, result_score
+                    FROM paper_bankroll_ledger
+                    ORDER BY fixture_id
+                    """
+                ).fetchall()
+
+            self.assertEqual(pending, [due_fixture])
+            self.assertEqual(client.requested, [int(due_fixture)])
+            self.assertEqual(sync_result["synced"], [due_fixture])
+            self.assertEqual(sync_result["paperLedgerPending"], [due_fixture])
+            self.assertEqual(settle_result["settledCount"], 1)
+            self.assertEqual(rows[0]["status"], "SETTLED")
+            self.assertAlmostEqual(rows[0]["profit"], 100.0)
+            self.assertEqual(rows[0]["result_score"], "1-0")
+            self.assertEqual(rows[1]["status"], "OPEN")
 
 
 if __name__ == "__main__":

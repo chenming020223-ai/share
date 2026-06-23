@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from io import BytesIO
 from copy import deepcopy
 from datetime import datetime
@@ -83,6 +84,21 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
         "",
         "最可能比分：",
     ]
+    exp_summary_rows, exp_component_rows = _exp_audit_rows(payload, home, away)
+    if exp_summary_rows:
+        lines[-1:-1] = [
+            "",
+            "### 二附、综合优势 exp 计算",
+            "",
+            *[f"- {label}：{value}" for label, value in exp_summary_rows],
+        ]
+        if exp_component_rows:
+            lines[-1:-1] = [
+                "",
+                "| 优势项 | 数值 | 倾向 |",
+                "|---|---:|---|",
+                *[f"| {label} | {value} | {side} |" for label, value, side in exp_component_rows],
+            ]
     if scores:
         for item in scores[:6]:
             lines.append(f"- {item.get('score')}: {_pct(item.get('probability'))}")
@@ -195,7 +211,7 @@ def build_chinese_report(payload: dict[str, Any]) -> str:
             "",
             "- 本报告只看 90 分钟赛果。",
             "- 展示融合概率仅用于比较，不是已验证的 pfinal。",
-            "- 当前研究试算 EV 基于 pbase 与市场价格；在 pshr/pfinal 经校准回测验证前，API 模式不得产生正式模拟信号。",
+            "- 当前纸上模拟按 paper_EV / p_adj 占用纸上资金；pfinal/formal_EV 通过校准回测前，真实执行仍关闭。",
             "- 当基础模型与当前市场基准去水概率发生重大分歧时，主界面与模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
             "- 当前时间切分校准审计仅覆盖胜平负；大小球和让球仍需独立的比分分布验收。",
             "- 正式 API 模式仅使用庄家优先级中同一全场盘口的赔率计算 EV。",
@@ -234,6 +250,9 @@ def build_excel_report(payload: dict[str, Any]) -> bytes:
 
     row = _write_key_values(sheet, row, data["summary"], body_font)
     row = _write_table(sheet, row + 1, "核心概率", ["结果", "展示融合概率（非 pfinal）", "pbase 基础概率", "qmkt 市场去水概率"], data["probability_rows"], section_fill, section_font, header_fill, header_font, body_font)
+    row = _write_table(sheet, row + 1, "预期进球与综合优势 exp", ["项目", "数值"], data["expected_rows"], section_fill, section_font, header_fill, header_font, body_font)
+    if data["exp_component_rows"]:
+        row = _write_table(sheet, row + 1, "综合优势分解", ["优势项", "数值", "倾向"], data["exp_component_rows"], section_fill, section_font, header_fill, header_font, body_font)
     row = _write_table(sheet, row + 1, "最可能比分", ["比分", "概率"], data["score_rows"], section_fill, section_font, header_fill, header_font, body_font)
     row = _write_table(sheet, row + 1, "数据质量与市场完整性", ["市场", "状态", "盘口", "说明"], data["quality_rows"], section_fill, section_font, header_fill, header_font, body_font)
     if data["processing_rows"]:
@@ -318,6 +337,8 @@ def build_pdf_report(payload: dict[str, Any]) -> bytes:
     section("二、预期进球与比分")
     for row in data["expected_rows"]:
         text_line("  ".join(str(item) for item in row), body_font)
+    if data["exp_component_rows"]:
+        text_line("综合优势分解：" + "；".join(" ".join(str(item) for item in row) for row in data["exp_component_rows"]), small_font, muted)
     text_line("最可能比分：" + "；".join(f"{score} {prob}" for score, prob in data["score_rows"]), small_font, muted)
 
     section("三、数据质量与市场完整性")
@@ -436,10 +457,8 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
             ["平局", _pct(display.get("draw")), _pct(pbase.get("draw")), _pct_or_dash(qmkt.get("draw") if qmkt else None)],
             [f"{away} 胜", _pct(display.get("away_win")), _pct(pbase.get("away_win")), _pct_or_dash(qmkt.get("away_win") if qmkt else None)],
         ],
-        "expected_rows": [
-            [home, _num(expected_goals.get("home"))],
-            [away, _num(expected_goals.get("away"))],
-        ],
+        "expected_rows": _expected_rows(payload, home, away),
+        "exp_component_rows": _exp_audit_rows(payload, home, away)[1],
         "score_rows": [[item.get("score"), _pct(item.get("probability"))] for item in scores[:8]] or [["暂无", "-"]],
         "quality_rows": [
             [
@@ -500,13 +519,86 @@ def _report_data(payload: dict[str, Any]) -> dict[str, Any]:
         "boundaries": [
             "本报告只看 90 分钟赛果。",
             "展示融合概率仅用于比较，不是已验证的 pfinal。",
-            "当前研究试算 EV 基于 pbase 与市场价格；在 pshr/pfinal 经校准回测验证前，API 模式不得产生正式模拟信号。",
+            "当前纸上模拟按 paper_EV / p_adj 占用纸上资金；pfinal/formal_EV 通过校准回测前，真实执行仍关闭。",
             "基础模型与当前市场基准去水概率重大分歧时，模拟舱暂停 EV 数值；原始试算仅保留在审计附录。",
             "当前时间切分校准审计仅覆盖胜平负；大小球和让球仍需独立的比分分布验收。",
             "正式 API 模式仅使用庄家优先级中同一全场盘口的赔率计算 EV。",
             "本报告用于本地研究和纸上回测，不连接真实投注平台，也不保证收益。",
         ],
     }
+
+
+def _expected_rows(payload: dict[str, Any], home: str, away: str) -> list[list[str]]:
+    expected_goals = payload.get("expectedGoals") or {}
+    rows = [
+        [f"{home} 最终预期进球 λ", _num(expected_goals.get("home"))],
+        [f"{away} 最终预期进球 λ", _num(expected_goals.get("away"))],
+    ]
+    exp_summary_rows, _ = _exp_audit_rows(payload, home, away)
+    rows.extend([[label, value] for label, value in exp_summary_rows])
+    return rows
+
+
+def _exp_audit_rows(payload: dict[str, Any], home: str, away: str) -> tuple[list[tuple[str, str]], list[list[str]]]:
+    expected_goals = payload.get("expectedGoals") or {}
+    feature_edges = payload.get("featureEdges") or {}
+    if not expected_goals and not feature_edges:
+        return [], []
+
+    component_keys = [
+        "elo_edge",
+        "fifa_rank_edge",
+        "host_edge",
+        "rest_edge",
+        "travel_edge",
+        "group_context_edge",
+        "rotation_edge",
+        "h2h_edge",
+        "country_relation_edge",
+        "commercial_incentive_edge",
+    ]
+    component_labels = {
+        "elo_edge": "Elo 强度差",
+        "fifa_rank_edge": "FIFA 排名差",
+        "host_edge": "主场/中立场",
+        "rest_edge": "休息天数",
+        "travel_edge": "旅行距离",
+        "group_context_edge": "积分/战意",
+        "rotation_edge": "轮换风险",
+        "h2h_edge": "历史交锋",
+        "country_relation_edge": "国家关系",
+        "commercial_incentive_edge": "商业动机",
+    }
+    components: list[tuple[str, float, str]] = []
+    for key in component_keys:
+        value = _finite_float(feature_edges.get(key), 0.0)
+        side = home if value > 0 else away if value < 0 else "中性"
+        components.append((component_labels.get(key, key), value, side))
+
+    fallback_log_edge = sum(value for _, value, _ in components)
+    log_edge = _finite_float(expected_goals.get("logEdge"), fallback_log_edge)
+    home_multiplier = _finite_float(expected_goals.get("homeExpMultiplier"), math.exp(log_edge))
+    away_multiplier = _finite_float(expected_goals.get("awayExpMultiplier"), math.exp(-log_edge))
+    draw_boost = _finite_float(feature_edges.get("rivalry_draw_boost"), 0.0)
+
+    summary_rows: list[tuple[str, str]] = [
+        ("基础 λ", f"{home} {_num(expected_goals.get('baseHome'))} / {away} {_num(expected_goals.get('baseAway'))}"),
+        ("综合优势 log_edge", f"{_signed_num(log_edge, 3)}（正数偏向 {home}，负数偏向 {away}）"),
+        ("exp 倍率", f"{home} ×{_num(home_multiplier, 3)} / {away} ×{_num(away_multiplier, 3)}"),
+        ("exp 修正后 λ", f"{home} {_num(expected_goals.get('rawHome'))} / {away} {_num(expected_goals.get('rawAway'))}"),
+        (
+            "风险收缩后最终 λ",
+            f"{home} {_num(expected_goals.get('home'))} / {away} {_num(expected_goals.get('away'))}，shrink_factor {_num(expected_goals.get('lambdaShrinkFactor'))}",
+        ),
+        ("公式", f"{home} λ = 基础 λ × exp(log_edge)；{away} λ = 基础 λ × exp(-log_edge)"),
+        ("平局增强", f"draw_boost {_signed_num(draw_boost, 3)}，不进入 exp，单独修正平局概率"),
+    ]
+    component_rows = [
+        [label, _signed_num(value, 3), side]
+        for label, value, side in components
+        if abs(value) > 1e-12
+    ]
+    return summary_rows, component_rows
 
 
 def _write_key_values(sheet, row, values, body_font):
@@ -687,9 +779,19 @@ def _ev_path_text(item: dict[str, Any]) -> str:
         )
 
     settlement = calc.get("settlement") or {}
+    calibration = calc.get("scoreDistributionCalibration") or calc.get("totalGoalsCalibration") or {}
+    calibration_text = ""
+    if isinstance(calibration, dict) and calibration.get("applied"):
+        calibration_text = (
+            f"分布校准：{calibration.get('marketLabel') or '比分分布'}·{calibration.get('sideLabel') or '方向'}"
+            f"因子 {_num(calibration.get('positiveFactor'))}，"
+            f"样本 {calibration.get('sampleCount') or 0}，"
+            f"原始EV {_pct_or_dash(calc.get('rawExpectedValue'))} -> 校准EV {ev}；"
+        )
     return (
         f"{calc.get('formula') or 'EV'}：盈利注权重 {_num(calc.get('winStakeFraction'))} × "
         f"(赔率 {odds} - 1) - 亏损注权重 {_num(calc.get('lossStakeFraction'))} = {ev}；"
+        f"{calibration_text}"
         f"全赢 {_pct(settlement.get('fullWinProbability'))}，半赢 {_pct(settlement.get('halfWinProbability'))}，"
         f"走水 {_pct(settlement.get('pushProbability'))}，半输 {_pct(settlement.get('halfLossProbability'))}，"
         f"全输 {_pct(settlement.get('fullLossProbability'))}；"
@@ -789,25 +891,43 @@ def _report_safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _num(value: Any) -> str:
+def _finite_float(value: Any, default: float | None = None) -> float | None:
     try:
-        return f"{float(value):.2f}"
+        number = float(value)
     except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def _num(value: Any, digits: int = 2) -> str:
+    number = _finite_float(value)
+    if number is None:
         return "-"
+    return f"{number:.{digits}f}"
+
+
+def _signed_num(value: Any, digits: int = 2) -> str:
+    number = _finite_float(value)
+    if number is None:
+        return "-"
+    prefix = "+" if number > 0 else ""
+    return f"{prefix}{number:.{digits}f}"
 
 
 def _money(value: Any) -> str:
-    try:
-        return f"{float(value):.2f} 元"
-    except (TypeError, ValueError):
+    number = _finite_float(value)
+    if number is None:
         return "-"
+    return f"{number:.2f} 元"
 
 
 def _odd(value: Any) -> str:
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
+    number = _finite_float(value)
+    if number is None:
         return "-"
+    return f"{number:.2f}"
 
 
 def _line(value: Any) -> str:
@@ -850,7 +970,7 @@ def _bookmaker_for_safe_audit(payload: dict[str, Any]) -> str:
 def _action_label(value: Any) -> str:
     return {
         "BUY": "模型候选（未执行）",
-        "PAPER_BUY": "纸上观察",
+        "PAPER_BUY": "纸上模拟",
         "WATCH": "观望",
         "NO_MARKET": "市场缺失",
         "MODEL_CANDIDATE": "模型候选（未执行）",

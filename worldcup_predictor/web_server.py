@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hmac
 import json
 import mimetypes
 import random
+import threading
+import time
 import urllib.parse
 from dataclasses import asdict
 from datetime import datetime
@@ -17,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from .api_football import ApiFootballClient, ApiFootballError
 from .auto_predict import MIN_VALID_RECENT_MATCHES, RECENT_MATCH_FETCH_COUNT, run_auto_prediction
-from .backtest import sync_completed_results
+from .backtest import sync_completed_paper_ledger_results, sync_completed_results
 from .betting import DEFAULT_MIN_EDGE, build_distribution_audit, build_recommendations
 from .calibration import MARKET_DATASET_VERSION, PBASE_MODEL_VERSION, build_model_validation_status
 from .data_quality import apply_quality_gate, build_data_quality_report
@@ -37,10 +40,15 @@ from .live_readiness import build_live_readiness_status
 from .market import MarketSnapshot
 from .model_governance import sample_model_governance
 from .models import ModelConfig, as_bool, as_float, clamp
+from .odds_monitor import collect_fixture_odds_snapshots
+from .paper_bankroll import build_paper_ledger_book
 from .predictor import predict_match
 from .poisson import score_matrix
+from .payload_governance import apply_current_score_validation_to_payload
 from .report import build_chinese_report, build_excel_report, build_pdf_report
+from .replay import build_history_replay_ledger, build_prediction_replay
 from .review import build_daily_review, build_daily_review_excel
+from .score_calibration import build_score_distribution_calibration_status
 from .settings import env_bool, env_int, env_str
 from .storage import (
     get_batch_prediction_payload,
@@ -58,6 +66,12 @@ from .storage import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = PROJECT_ROOT / "web"
+_MODEL_VALIDATION_CACHE: tuple[float, dict[str, Any]] | None = None
+_AUTO_SETTLEMENT_LOCK = threading.Lock()
+_AUTO_SETTLEMENT_STARTED = False
+_AUTO_SETTLEMENT_RUNNING = False
+_AUTO_SETTLEMENT_LAST_RUN = 0.0
+_AUTO_SETTLEMENT_LAST_RESULT: dict[str, Any] | None = None
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -72,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     server = ReusableThreadingHTTPServer((args.host, args.port), PredictorWebHandler)
+    start_auto_settlement_worker()
     print(f"World Cup predictor web app: http://{args.host}:{args.port}")
     try:
         server.serve_forever()
@@ -80,6 +95,87 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.server_close()
     return 0
+
+
+def start_auto_settlement_worker() -> None:
+    global _AUTO_SETTLEMENT_STARTED
+    if not env_bool("WORLDCUP_AUTO_SETTLEMENT_ENABLED", True):
+        return
+    with _AUTO_SETTLEMENT_LOCK:
+        if _AUTO_SETTLEMENT_STARTED:
+            return
+        _AUTO_SETTLEMENT_STARTED = True
+    thread = threading.Thread(target=_auto_settlement_loop, name="paper-settlement", daemon=True)
+    thread.start()
+
+
+def _auto_settlement_loop() -> None:
+    initial_delay = max(5, env_int("WORLDCUP_AUTO_SETTLEMENT_INITIAL_DELAY_SECONDS", 15))
+    time.sleep(initial_delay)
+    while True:
+        run_auto_settlement_once(source="background")
+        time.sleep(_auto_settlement_interval_seconds())
+
+
+def run_auto_settlement_once(source: str = "background", force: bool = False) -> dict[str, Any]:
+    global _AUTO_SETTLEMENT_LAST_RESULT, _AUTO_SETTLEMENT_LAST_RUN, _AUTO_SETTLEMENT_RUNNING
+    if not env_bool("WORLDCUP_AUTO_SETTLEMENT_ENABLED", True):
+        return {"ok": True, "source": source, "skipped": "disabled"}
+    current = time.monotonic()
+    with _AUTO_SETTLEMENT_LOCK:
+        if _AUTO_SETTLEMENT_RUNNING:
+            return {
+                "ok": True,
+                "source": source,
+                "skipped": "already_running",
+                "lastResult": _AUTO_SETTLEMENT_LAST_RESULT,
+            }
+        if not force and current - _AUTO_SETTLEMENT_LAST_RUN < _auto_settlement_interval_seconds():
+            return {
+                "ok": True,
+                "source": source,
+                "skipped": "interval",
+                "lastResult": _AUTO_SETTLEMENT_LAST_RESULT,
+            }
+        _AUTO_SETTLEMENT_RUNNING = True
+        _AUTO_SETTLEMENT_LAST_RUN = current
+    result: dict[str, Any]
+    try:
+        sync_result = sync_completed_paper_ledger_results()
+        paper_ledger = settle_open_paper_ledger()
+        result = {
+            "ok": True,
+            "source": source,
+            "syncedCount": len(sync_result.get("synced") or []),
+            "awaitingCount": len(sync_result.get("awaitingCompletion") or []),
+            "settledCount": int(paper_ledger.get("settledCount") or 0),
+            "sync": sync_result,
+            "paperLedger": paper_ledger,
+        }
+    except ApiFootballError as exc:
+        try:
+            paper_ledger = settle_open_paper_ledger()
+        except Exception as ledger_exc:  # noqa: BLE001 - preserve the API error while reporting ledger failure.
+            paper_ledger = {"settledCount": 0, "error": str(ledger_exc)}
+        result = {
+            "ok": False,
+            "source": source,
+            "error": str(exc),
+            "errorKind": exc.kind,
+            "settledCount": int(paper_ledger.get("settledCount") or 0),
+            "paperLedger": paper_ledger,
+        }
+    except Exception as exc:  # noqa: BLE001 - background maintenance must not break page reads.
+        result = {"ok": False, "source": source, "error": str(exc)}
+    finally:
+        with _AUTO_SETTLEMENT_LOCK:
+            _AUTO_SETTLEMENT_LAST_RESULT = result
+            _AUTO_SETTLEMENT_RUNNING = False
+    return result
+
+
+def _auto_settlement_interval_seconds() -> int:
+    return max(60, env_int("WORLDCUP_AUTO_SETTLEMENT_INTERVAL_SECONDS", 300))
 
 
 class PredictorWebHandler(BaseHTTPRequestHandler):
@@ -126,10 +222,16 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
             self._send_json(api_status_payload())
             return
         if path == "/api/model-validation":
-            self._send_json(build_model_validation_status())
+            self._send_json(model_validation_payload())
             return
         if path == "/api/live-readiness":
             self._send_json(build_live_readiness_status())
+            return
+        if path == "/api/paper-ledger":
+            auto_settlement = run_auto_settlement_once(source="paper-ledger-view")
+            book = build_paper_ledger_book()
+            book["autoSettlement"] = auto_settlement
+            self._send_json(book)
             return
         if path == "/api/daily-review":
             query = urllib.parse.parse_qs(parsed.query)
@@ -176,7 +278,24 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
             if not payload:
                 self._send_error(HTTPStatus.NOT_FOUND, "Prediction not found")
                 return
-            self._send_json(payload)
+            self._send_json(_current_display_payload(payload))
+            return
+        if path == "/api/prediction-replay":
+            query = urllib.parse.parse_qs(parsed.query)
+            run_id = _optional_int((query.get("run_id") or [""])[0])
+            if not run_id:
+                self._send_error(HTTPStatus.BAD_REQUEST, "Missing run_id")
+                return
+            try:
+                self._send_json(build_prediction_replay(run_id))
+            except ValueError:
+                self._send_error(HTTPStatus.NOT_FOUND, "Prediction not found")
+            return
+        if path == "/api/history-replay-ledger":
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = _optional_int((query.get("limit") or [""])[0]) or 120
+            bankroll = _optional_float((query.get("bankroll") or [""])[0]) or 1000.0
+            self._send_json(build_history_replay_ledger(limit=limit, starting_bankroll=bankroll))
             return
         if path == "/api/search-fixtures":
             try:
@@ -210,6 +329,7 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
             if not payload:
                 self._send_error(HTTPStatus.NOT_FOUND, "Report not found")
                 return
+            payload = _current_display_payload(payload)
             report_format = ((query.get("format") or ["pdf"])[0] or "pdf").casefold()
             if report_format in {"xlsx", "excel"}:
                 self._send_file(
@@ -252,6 +372,7 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
             "/api/update-batch",
             "/api/mark-official-batch",
             "/api/sync-results",
+            "/api/collect-odds-snapshot",
         }:
             self._send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -283,8 +404,21 @@ class PredictorWebHandler(BaseHTTPRequestHandler):
                     api_key=_api_key_from_request(payload),
                 )
                 sync_result["paperLedger"] = settle_open_paper_ledger()
-                sync_result["modelValidation"] = build_model_validation_status()
+                sync_result["modelValidation"] = model_validation_payload(force_refresh=True)
                 self._send_json(sync_result)
+                return
+            if self.path == "/api/collect-odds-snapshot":
+                fixture_ids = _parse_fixture_ids(payload.get("fixtureIds") or payload.get("fixtureId"))
+                if not fixture_ids:
+                    self._send_error(HTTPStatus.BAD_REQUEST, "Missing fixture_id")
+                    return
+                self._send_json(
+                    collect_fixture_odds_snapshots(
+                        fixture_ids,
+                        api_key=_api_key_from_request(payload),
+                        bookmaker_priority=payload.get("bookmakerPriority") or payload.get("bookmaker_priority"),
+                    )
+                )
                 return
             if self.path == "/api/mark-official-batch":
                 batch_id = _optional_int(payload.get("batchId") or payload.get("batch_id"))
@@ -420,12 +554,23 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
     min_quality = clamp(as_float(payload.get("minQuality"), 0.60), 0.0, 1.0)
     force_picks = False
 
-    if mode == "auto":
+    if mode in {"auto", "historical", "historical_asof"}:
         home_value = str(payload.get("home") or "").strip()
         away_value = str(payload.get("away") or "").strip()
         fixture_id = _optional_int(payload.get("fixtureId"))
+        historical_mode = mode in {"historical", "historical_asof"}
+        staking_context = _paper_staking_context(
+            starting_bankroll=bankroll,
+            unit_stake=unit,
+            enabled=not historical_mode and client is None,
+        )
         if not fixture_id and (not home_value or not away_value):
             raise ValueError("API 模式需要填写两支球队，或填写 fixture_id。")
+        if historical_mode and not fixture_id:
+            raise ValueError("历史赛前模拟必须填写已知 fixture_id，防止匹配到错误赛程。")
+        source = client or CachedApiFootballClient(api_key=_api_key_from_request(payload))
+        validation = model_validation_payload()
+        score_validation = validation.get("scoreDistributionValidation") or build_score_distribution_calibration_status()
         auto = run_auto_prediction(
             home_value,
             away_value,
@@ -433,13 +578,24 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
             fixture_id=fixture_id,
             collection_mode=str(payload.get("collectionMode") or ""),
             market_weight=market_weight,
-            bankroll=bankroll,
+            bankroll=staking_context["currentBankroll"],
             unit_stake=unit,
             min_edge=min_edge,
             force_picks=force_picks,
             bookmaker_priority=payload.get("bookmakerPriority"),
-            client=client,
+            client=source,
+            historical_as_of=(
+                str(payload.get("historicalAsOf") or payload.get("historical_as_of") or "").strip()
+                if historical_mode
+                else None
+            ),
+            score_distribution_calibration=score_validation,
+            starting_bankroll=staking_context["startingBankroll"],
+            realized_pnl=staking_context["realizedPnl"],
+            reserved_stake=staking_context["reservedStake"],
         )
+        if staking_context.get("enabled"):
+            auto.data_notes.append(str(staking_context["note"]))
         quality = build_data_quality_report(
             auto.market,
             fixture_id=auto.fixture_id,
@@ -449,15 +605,16 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
             min_quality=min_quality,
             max_score=_quality_cap_for_recent_form(auto.recent_form_available, min_quality),
         )
-        snapshot_id = _record_auto_snapshot(auto, "API-Football")
+        snapshot_id = None if historical_mode else _record_auto_snapshot(auto, "API-Football")
         recommendations, portfolio = apply_quality_gate(
             auto.recommendations,
             auto.portfolio,
             quality,
             enforce=True,
         )
+        data_source = "历史赛前模拟（不进入正式验收）" if historical_mode else "API-Football"
         return {
-            "mode": "auto",
+            "mode": "historical_asof" if historical_mode else "auto",
             "meta": {
                 "fixtureId": auto.fixture_id,
                 "leagueId": auto.league_id,
@@ -468,8 +625,12 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
                 "kickoff": auto.kickoff,
                 "kickoffBeijing": to_beijing_time(auto.kickoff),
                 "venue": auto.venue,
-                "dataSource": "API-Football",
+                "dataSource": data_source,
                 "snapshotId": snapshot_id,
+                "historicalMode": historical_mode,
+                "historicalAsOf": auto.historical_as_of or "",
+                "historicalAsOfBeijing": to_beijing_time(auto.historical_as_of or ""),
+                "leakageGuard": historical_mode,
                 "requiredBookmaker": auto.market.required_bookmaker or "-",
                 "bookmakerPriority": auto.market.bookmaker_priority,
                 "selectedBookmakers": auto.market.selected_bookmakers,
@@ -491,7 +652,7 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
                 "recentMatchesRequested": RECENT_MATCH_FETCH_COUNT,
             },
             "snapshotId": snapshot_id,
-            "modelValidation": build_model_validation_status(),
+            "modelValidation": validation,
             "dataProcessing": _data_processing_payload(auto),
             **_prediction_payload(
                 auto.result,
@@ -502,6 +663,7 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
                 quality,
                 auto.governance,
                 auto.risk_context,
+                team_visuals=_team_visuals_from_auto(auto),
             ),
         }
 
@@ -518,6 +680,43 @@ def run_web_prediction(payload: dict[str, Any], client: ApiFootballClient | None
     )
 
 
+def _paper_staking_context(
+    *,
+    starting_bankroll: float,
+    unit_stake: float | None,
+    enabled: bool,
+) -> dict[str, Any]:
+    start = max(1.0, float(starting_bankroll or 1000.0))
+    if not enabled or (unit_stake is not None and unit_stake > 0):
+        return {
+            "enabled": False,
+            "startingBankroll": start,
+            "currentBankroll": start,
+            "realizedPnl": None,
+            "reservedStake": 0.0,
+            "note": "手动注额或隔离模式：不读取模拟舱滚动资金。",
+        }
+
+    summary = (build_paper_ledger_book(starting_bankroll=start).get("summary") or {})
+    equity = _optional_float(summary.get("equity"))
+    realized = _optional_float(summary.get("realizedPnl"))
+    reserved = _optional_float(summary.get("reservedStake")) or 0.0
+    cash = _optional_float(summary.get("cash"))
+    current = equity if equity is not None else start
+    return {
+        "enabled": True,
+        "startingBankroll": start,
+        "currentBankroll": current,
+        "realizedPnl": realized,
+        "reservedStake": reserved,
+        "note": (
+            "模拟舱动态资金：按滚动权益 "
+            f"{current:.2f}、可用现金 {(cash if cash is not None else max(0.0, current - reserved)):.2f}、"
+            f"未结算预留 {reserved:.2f} 计算纸上注额；盈利仅 50% 纳入下一轮下注本金池。"
+        ),
+    }
+
+
 def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
     bankroll = as_float(payload.get("bankroll"), 1000.0)
     unit = _optional_float(payload.get("unit"))
@@ -525,8 +724,14 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
     min_edge = clamp(as_float(payload.get("minEdge"), DEFAULT_MIN_EDGE), 0.0, 1.0)
     min_quality = clamp(as_float(payload.get("minQuality"), 0.60), 0.0, 1.0)
     date = str(payload.get("date") or _today_shanghai())
+    staking_context = _paper_staking_context(
+        starting_bankroll=bankroll,
+        unit_stake=unit,
+        enabled=True,
+    )
 
-    client = ApiFootballClient(api_key=_api_key_from_request(payload))
+    client = CachedApiFootballClient(api_key=_api_key_from_request(payload))
+    validation = model_validation_payload()
     fixtures = [
         item
         for item in client.fixtures_by_date(date)
@@ -547,12 +752,19 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
         fixture_id=fixture_id,
         collection_mode=str(payload.get("collectionMode") or ""),
         market_weight=market_weight,
-        bankroll=bankroll,
+        bankroll=staking_context["currentBankroll"],
         unit_stake=unit,
         min_edge=min_edge,
         force_picks=False,
         bookmaker_priority=payload.get("bookmakerPriority"),
+        client=client,
+        score_distribution_calibration=validation.get("scoreDistributionValidation"),
+        starting_bankroll=staking_context["startingBankroll"],
+        realized_pnl=staking_context["realizedPnl"],
+        reserved_stake=staking_context["reservedStake"],
     )
+    if staking_context.get("enabled"):
+        auto.data_notes.append(str(staking_context["note"]))
     quality = build_data_quality_report(
         auto.market,
         fixture_id=auto.fixture_id,
@@ -604,7 +816,7 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             "recentMatchesRequested": RECENT_MATCH_FETCH_COUNT,
         },
         "snapshotId": snapshot_id,
-        "modelValidation": build_model_validation_status(),
+        "modelValidation": validation,
         "dataProcessing": _data_processing_payload(auto),
         **_prediction_payload(
             auto.result,
@@ -615,6 +827,7 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             quality,
             auto.governance,
             auto.risk_context,
+            team_visuals=_team_visuals_from_auto(auto),
         ),
     }
     return result
@@ -675,6 +888,8 @@ def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
         fixture_id = _optional_int(fixture.get("id"))
         home = str((teams.get("home") or {}).get("name") or "")
         away = str((teams.get("away") or {}).get("name") or "")
+        home_logo = _team_logo_from_teams(teams, "home")
+        away_logo = _team_logo_from_teams(teams, "away")
         try:
             result = run_web_prediction(
                 {
@@ -693,9 +908,22 @@ def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
             )
             run_id = record_prediction(result)
             result["runId"] = run_id
-            collected.append(_batch_collected_item(result, run_id, fixture_id, home, away, league, fixture, bankroll))
+            collected.append(
+                _batch_collected_item(
+                    result,
+                    run_id,
+                    fixture_id,
+                    home,
+                    away,
+                    league,
+                    fixture,
+                    bankroll,
+                    home_logo=home_logo,
+                    away_logo=away_logo,
+                )
+            )
         except (ApiFootballError, ValueError) as exc:
-            failed.append(_batch_failed_item(fixture_id, home, away, league, fixture, exc))
+            failed.append(_batch_failed_item(fixture_id, home, away, league, fixture, exc, home_logo=home_logo, away_logo=away_logo))
 
     collected = sorted(collected, key=_batch_sort_key, reverse=True)
 
@@ -735,7 +963,7 @@ def search_api_fixtures(
     if not home_name:
         raise ValueError("请至少填写球队 A。")
 
-    client = ApiFootballClient(api_key=api_key.strip() if api_key else None)
+    client = CachedApiFootballClient(api_key=api_key.strip() if api_key else None)
     home = client.resolve_team(to_api_name("team", home_name))
     away = client.resolve_team(to_api_name("team", away_name)) if away_name else None
 
@@ -763,7 +991,7 @@ def today_fixture_options(
 ) -> dict[str, Any]:
     if scope not in {"first_division", "all"}:
         raise ValueError("今日赛程范围仅支持甲级联赛或全部比赛。")
-    source = client or ApiFootballClient(api_key=api_key)
+    source = client or CachedApiFootballClient(api_key=api_key)
     rows = [
         item
         for item in source.fixtures_by_date(date)
@@ -904,6 +1132,86 @@ def health_payload() -> dict[str, Any]:
     }
 
 
+def model_validation_payload(*, force_refresh: bool = False) -> dict[str, Any]:
+    global _MODEL_VALIDATION_CACHE
+    cache_seconds = max(0, env_int("WORLDCUP_MODEL_VALIDATION_CACHE_SECONDS", 300))
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and cache_seconds > 0
+        and _MODEL_VALIDATION_CACHE is not None
+        and now - _MODEL_VALIDATION_CACHE[0] <= cache_seconds
+    ):
+        return copy.deepcopy(_MODEL_VALIDATION_CACHE[1])
+
+    payload = build_model_validation_status()
+    score_validation = build_score_distribution_calibration_status()
+    payload["scoreDistributionValidation"] = score_validation
+    payload["marketValidation"] = _market_validation_summary(payload, score_validation)
+    if cache_seconds > 0:
+        _MODEL_VALIDATION_CACHE = (now, copy.deepcopy(payload))
+    return payload
+
+
+def _market_validation_summary(
+    outcome_validation: dict[str, Any],
+    score_validation: dict[str, Any],
+) -> dict[str, Any]:
+    score_markets = score_validation.get("markets") or {}
+    outcome_checks = outcome_validation.get("checks") or []
+    return {
+        "1X2": {
+            "market": "1X2",
+            "marketLabel": "胜平负",
+            "probabilityObject": "pshr",
+            "status": outcome_validation.get("status"),
+            "statusLabel": outcome_validation.get("statusLabel"),
+            "paperEvEnabled": False,
+            "formalEvEnabled": False,
+            "samples": outcome_validation.get("eligibleSamples") or 0,
+            "distinctFixtures": outcome_validation.get("distinctFixtures") or 0,
+            "split": outcome_validation.get("split") or {},
+            "checks": outcome_checks,
+            "failedChecks": [item for item in outcome_checks if not item.get("passed")],
+            "metrics": outcome_validation.get("metrics") or {},
+            "note": "胜平负只验收三分类概率；通过后仍需 pfinal 人工审批才可开放正式 EV。",
+        },
+        "OU": _score_market_validation_item(score_markets.get("OU") or {}),
+        "AH": _score_market_validation_item(score_markets.get("AH") or {}),
+    }
+
+
+def _score_market_validation_item(market: dict[str, Any]) -> dict[str, Any]:
+    checks = market.get("checks") or []
+    return {
+        "market": market.get("market"),
+        "marketLabel": market.get("marketLabel"),
+        "probabilityObject": "score_distribution",
+        "status": market.get("status"),
+        "statusLabel": market.get("statusLabel"),
+        "paperEvEnabled": bool(market.get("paperEvEnabled")),
+        "formalEvEnabled": False,
+        "samples": market.get("sampleCount") or 0,
+        "distinctFixtures": market.get("distinctFixtures") or 0,
+        "split": market.get("split") or {},
+        "checks": checks,
+        "failedChecks": [item for item in checks if not item.get("passed")],
+        "validation": market.get("validation") or {},
+        "sides": market.get("sides") or {},
+        "note": "大小球/让球按比分分布层单独验收；未通过时不应用失败校准因子。",
+    }
+
+
+def _current_display_payload(
+    payload: dict[str, Any] | None,
+    score_validation: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    return apply_current_score_validation_to_payload(
+        payload,
+        score_validation if score_validation is not None else model_validation_payload().get("scoreDistributionValidation"),
+    )
+
+
 def _api_key_from_request(payload: dict[str, Any]) -> str | None:
     if env_bool("WORLDCUP_PUBLIC_MODE", False):
         return None
@@ -912,8 +1220,12 @@ def _api_key_from_request(payload: dict[str, Any]) -> str | None:
 
 def recent_prediction_options(limit: int = 12) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
+    score_validation = model_validation_payload().get("scoreDistributionValidation")
     for item in recent_predictions(limit=limit):
-        payload = get_prediction_payload(int(item["id"])) or {}
+        payload = _current_display_payload(
+            get_prediction_payload(int(item["id"])) or {},
+            score_validation=score_validation,
+        ) or {}
         match = payload.get("match") or {}
         meta = payload.get("meta") or {}
         portfolio = payload.get("portfolio") or {}
@@ -924,6 +1236,8 @@ def recent_prediction_options(limit: int = 12) -> list[dict[str, Any]]:
                 **item,
                 "homeZh": translate_team_display(match.get("home") or item.get("home_team"), "主队"),
                 "awayZh": translate_team_display(match.get("away") or item.get("away_team"), "客队"),
+                "homeLogo": match.get("homeLogo") or match.get("home_logo") or "",
+                "awayLogo": match.get("awayLogo") or match.get("away_logo") or "",
                 "leagueZh": translate_league_display(meta.get("leagueName"), meta.get("leagueCountry")),
                 "kickoffBeijing": meta.get("kickoffBeijing") or to_beijing_time(meta.get("kickoff")),
                 "predictionLabel": prediction["label"],
@@ -1038,6 +1352,8 @@ def _batch_collected_item(
     league: dict[str, Any],
     fixture: dict[str, Any],
     bankroll: float,
+    home_logo: str = "",
+    away_logo: str = "",
 ) -> dict[str, Any]:
     match = result.get("match") or {}
     meta = result.get("meta") or {}
@@ -1055,6 +1371,8 @@ def _batch_collected_item(
         "fixtureId": fixture_id,
         "home": match.get("homeZh") or translate_team_display(home, "主队"),
         "away": match.get("awayZh") or translate_team_display(away, "客队"),
+        "homeLogo": match.get("homeLogo") or match.get("home_logo") or home_logo,
+        "awayLogo": match.get("awayLogo") or match.get("away_logo") or away_logo,
         "league": meta.get("leagueNameZh") or translate_league_display(league.get("name"), league.get("country")),
         "kickoffBeijing": meta.get("kickoffBeijing") or to_beijing_time(fixture.get("date")),
         "bookmaker": meta.get("bookmaker") or "未取得",
@@ -1200,12 +1518,16 @@ def _batch_failed_item(
     league: dict[str, Any],
     fixture: dict[str, Any],
     exc: Exception,
+    home_logo: str = "",
+    away_logo: str = "",
 ) -> dict[str, Any]:
     failure = _classify_batch_failure(str(exc))
     return {
         "fixtureId": fixture_id,
         "home": translate_team_display(home, "主队"),
         "away": translate_team_display(away, "客队"),
+        "homeLogo": home_logo,
+        "awayLogo": away_logo,
         "league": translate_league_display(league.get("name"), league.get("country")),
         "kickoffBeijing": to_beijing_time(fixture.get("date")),
         "failureType": failure["type"],
@@ -1391,6 +1713,23 @@ def _api_error_status(exc: ApiFootballError) -> HTTPStatus:
     return HTTPStatus.BAD_REQUEST
 
 
+def _team_logo_from_teams(teams: dict[str, Any], side: str) -> str:
+    return str(((teams.get(side) or {}).get("logo") or "")).strip()
+
+
+def _team_visuals_from_fixture_row(row: dict[str, Any]) -> dict[str, str]:
+    teams = row.get("teams") or {}
+    return {
+        "homeLogo": _team_logo_from_teams(teams, "home"),
+        "awayLogo": _team_logo_from_teams(teams, "away"),
+    }
+
+
+def _team_visuals_from_auto(auto) -> dict[str, str]:
+    snapshot = getattr(auto, "raw_snapshot", None) or {}
+    return _team_visuals_from_fixture_row(snapshot.get("fixture") or {})
+
+
 def _fixture_option(row: dict[str, Any]) -> dict[str, Any]:
     fixture = row.get("fixture") or {}
     league = row.get("league") or {}
@@ -1411,6 +1750,8 @@ def _fixture_option(row: dict[str, Any]) -> dict[str, Any]:
         "season": league.get("season"),
         "home": home_name,
         "away": away_name,
+        "homeLogo": _team_logo_from_teams(teams, "home"),
+        "awayLogo": _team_logo_from_teams(teams, "away"),
         "homeZh": translate_team_display(home_name, "主队"),
         "awayZh": translate_team_display(away_name, "客队"),
         "homeNameStatus": "已收录" if translate_name("team", home_name) != home_name else "待核定",
@@ -1689,9 +2030,11 @@ def _prediction_payload(
     data_quality,
     governance,
     risk_context: dict[str, Any] | None = None,
+    team_visuals: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     home_zh = translate_team_display(result.home_team, "主队")
     away_zh = translate_team_display(result.away_team, "客队")
+    visuals = team_visuals or {}
     model_audit = build_distribution_audit(result, market)
     audit_notes = [str(model_audit["reason"])] if model_audit.get("evSuspended") else []
     return {
@@ -1701,6 +2044,8 @@ def _prediction_payload(
             "away": result.away_team,
             "homeZh": home_zh,
             "awayZh": away_zh,
+            "homeLogo": str(visuals.get("homeLogo") or ""),
+            "awayLogo": str(visuals.get("awayLogo") or ""),
         },
         "probabilities": {
             "display": result.final_probabilities,
@@ -1716,8 +2061,13 @@ def _prediction_payload(
         "expectedGoals": {
             "home": result.expected_goals_home,
             "away": result.expected_goals_away,
+            "baseHome": result.base_expected_goals_home,
+            "baseAway": result.base_expected_goals_away,
             "rawHome": result.raw_expected_goals_home,
             "rawAway": result.raw_expected_goals_away,
+            "logEdge": result.log_edge,
+            "homeExpMultiplier": result.home_exp_multiplier,
+            "awayExpMultiplier": result.away_exp_multiplier,
             "lambdaShrinkFactor": result.lambda_shrink_factor,
             "lambdaShrinkReasons": list(result.lambda_shrink_reasons or []),
             "scoreMatrixMaxGoals": result.score_matrix_max_goals,
@@ -1736,14 +2086,90 @@ def _prediction_payload(
                 "selection": localize_selection(item.selection, result.home_team, result.away_team),
                 "publicAction": _public_action(item),
                 "publicActionLabel": _public_action_label(item),
-                "formalExecutionEnabled": item.ev_pfinal_exec is not None,
+                "formalExecutionEnabled": item.action == "BUY" and item.ev_pfinal_exec is not None,
+                "paperSimulationEnabled": item.action == "PAPER_BUY" and item.stake > 0,
                 "stakeStatusLabel": "资金占用已关闭" if item.stake <= 0 else "纸上资金占用",
+                "evLayers": _ev_layers_for_recommendation(item),
             }
             for item in recommendations
         ],
         "portfolio": asdict(portfolio),
         "notes": [*audit_notes, *notes, *data_quality.notes, *governance.notes],
     }
+
+
+def _ev_layers_for_recommendation(item) -> dict[str, Any]:
+    calculation = getattr(item, "ev_calculation", None) or {}
+    signal = str(getattr(item, "signal_status", "") or getattr(item, "action", "") or "")
+    ev_status = str(getattr(item, "ev_status", "") or "")
+    suspended = signal in {"SUSPENDED", "MODEL_MARKET_CONFLICT"} or "SUSPENDED" in ev_status
+    score_research_only = calculation.get("evDecisionLayer") == "research_audit_only"
+    research_value = _first_present(
+        getattr(item, "ev_pbase_research", None),
+        getattr(item, "audit_expected_value_per_unit", None),
+        getattr(item, "expected_value_per_unit", None),
+    )
+    paper_value = _first_present(
+        getattr(item, "paper_expected_value_per_unit", None),
+        getattr(item, "ev_pshr_candidate", None),
+        getattr(item, "conservative_ev_pbase_research", None),
+        getattr(item, "audit_paper_expected_value_per_unit", None),
+        getattr(item, "audit_conservative_expected_value_per_unit", None),
+        getattr(item, "conservative_expected_value_per_unit", None),
+    )
+    formal_value = getattr(item, "ev_pfinal_exec", None)
+    return {
+        "research": {
+            "key": "research",
+            "label": "研究EV(pbase)",
+            "value": research_value,
+            "status": "paused" if suspended else "available" if research_value is not None else "missing",
+            "statusLabel": "已暂停" if suspended else "可研究" if research_value is not None else "缺失",
+            "probabilitySource": "pbase",
+            "participatesInMoney": False,
+        },
+        "paper": {
+            "key": "paper",
+            "label": "纸上EV(p_adj/pshr)",
+            "value": None if score_research_only else paper_value,
+            "status": (
+                "paused"
+                if suspended
+                else "not_open"
+                if score_research_only
+                else "candidate"
+                if paper_value is not None
+                else "missing"
+            ),
+            "statusLabel": (
+                "已暂停"
+                if suspended
+                else "未开放"
+                if score_research_only
+                else "候选观察"
+                if paper_value is not None
+                else "缺失"
+            ),
+            "probabilitySource": "pshr_or_score_distribution",
+            "participatesInMoney": False,
+        },
+        "formal": {
+            "key": "formal",
+            "label": "正式EV(pfinal)",
+            "value": formal_value,
+            "status": "enabled" if formal_value is not None and getattr(item, "action", "") == "BUY" else "closed",
+            "statusLabel": "可执行" if formal_value is not None and getattr(item, "action", "") == "BUY" else "未开放",
+            "probabilitySource": "pfinal",
+            "participatesInMoney": bool(formal_value is not None and getattr(item, "action", "") == "BUY"),
+        },
+    }
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _public_action(item) -> str:
@@ -1761,7 +2187,7 @@ def _public_action(item) -> str:
 
 def _public_action_label(item) -> str:
     return {
-        "PAPER_OBSERVATION": "纸上观察",
+        "PAPER_OBSERVATION": "纸上模拟",
         "SUSPENDED": "暂停复核",
         "NO_MARKET": "市场缺失",
         "MODEL_CANDIDATE": "模型候选（未执行）",

@@ -635,10 +635,10 @@ break_even_odds_total =
 valid_two_way_market(line)
 and research_EV_total(side*) >= min_ev
 and [P_positive_total(side*) - P_market(side*)] >= min_edge
-and score_distribution_validation_status = approved
+and score_distribution_market_status(OU) = PAPER_READY
 ```
 
-当前交付版本中，`score_distribution_validation_status` 尚未批准，因此大小球只输出 `research_EV_total` 和逐比分结算审计；`paper_EV`、`p_adj`、`shrink_k` 与 `formal_EV` 均显示为未开放，不进入模拟资金。
+当前交付版本中，大小球已完成比分分布独立校准并达到 `PAPER_READY`。大小球可输出 `paper_EV` 纸上复核候选，但 `formal_EV` 仍等待 `pfinal` 审批，不进入正式资金。
 
 ### 3.4 让球亚洲盘结算
 
@@ -701,10 +701,10 @@ break_even_odds_handicap =
 valid_two_way_market(line)
 and research_EV_handicap(side*) >= min_ev
 and [P_positive_handicap(side*) - P_market(side*)] >= min_edge
-and score_distribution_validation_status = approved
+and score_distribution_market_status(AH) = PAPER_READY
 ```
 
-当前交付版本中，让球同样只输出 `research_EV_handicap` 和逐比分结算审计；由于比分分布层与盘口线表现尚未完成独立回测，`paper_EV`、`p_adj`、`shrink_k` 与 `formal_EV` 均不开放。
+当前交付版本中，让球样本已经进入独立校准，但验证集 EV 误差校准后劣化，状态为 `REJECTED`。因此让球继续只输出 `research_EV_handicap` 和逐比分结算审计；`paper_EV`、`p_adj`、`shrink_k` 与 `formal_EV` 均不开放。
 
 ### 3.5 模拟舱资金
 
@@ -1194,7 +1194,7 @@ CLV_decimal = O_bet / O_close - 1
 
 如果长期 `CLV_decimal > 0`，说明模型经常拿到优于收盘线的价格。
 
-### 5.7 `pshr` 时间切分校准审计（已实现第一版）
+### 5.7 `pshr` 时间切分校准审计（V2）
 
 当前第一版只审计胜平负三分类概率。可进入样本集的预测必须满足：
 
@@ -1217,7 +1217,7 @@ calibration = next 20%
 validation  = latest 20%
 ```
 
-在校准区间拟合市场收缩权重 `alpha`：
+旧版候选会在校准区间拟合市场收缩权重 `alpha`：
 
 ```text
 alpha in {0.00, 0.05, ..., 1.00}
@@ -1227,10 +1227,35 @@ pshr_alpha(k) = (1 - alpha) * pbase(k) + alpha * qmkt(k)
 alpha* = argmin_alpha AverageLogLoss_calibration(pshr_alpha)
 ```
 
+实测发现，小样本校准区间容易把 `alpha*` 推到 `1.00`，使 `pshr` 退化为市场概率复刻。V2 公式改为主胜、平局、客胜的类别偏差校准，市场收缩权重只作为审计字段保存，不直接作为候选执行权重：
+
+```text
+actual_rate_k = count(actual = k) / N_cal
+pred_rate_k   = mean_calibration(pbase_k)
+
+target_rate_k =
+    (actual_rate_k * N_cal + pred_rate_k * prior_samples)
+    / (N_cal + prior_samples)
+
+factor_k = clamp(target_rate_k / pred_rate_k, 0.75, 1.35)
+
+pshr_v2(k) = normalize(pbase(k) * factor_k)
+```
+
+当前默认：
+
+```text
+prior_samples = 20
+market_weight = 0.00
+raw_market_weight = alpha*  # 仅用于审计，不进入 pshr_v2
+```
+
+这样做的目的不是绕开市场，而是避免短校准窗把模型完全拉成市场概率；市场 `qmkt` 继续作为验证区间的基准对照。
+
 在验证区间仅评估、不得再次调参：
 
 ```text
-evaluate pbase, qmkt, pshr_alpha*
+evaluate pbase, qmkt, pshr_v2
 using Brier Score, Log Loss, Calibration Error
 ```
 
@@ -1246,7 +1271,7 @@ pshr LogLoss <= qmkt LogLoss + 0.02 on validation
 pshr Brier <= qmkt Brier + 0.01 on validation
 ```
 
-即使上述条件全部满足，程序也仅输出 `ELIGIBLE_FOR_REVIEW`，不会自动将 `formal_ev_enabled` 设为真。大小球和让球仍需针对比分分布及亚洲盘结算另行完成校准验收。
+即使上述条件全部满足，程序也仅输出 `ELIGIBLE_FOR_REVIEW`，不会自动将 `formal_ev_enabled` 设为真。比分分布层已改为分市场验收：大小球当前 `PAPER_READY`，让球当前 `REJECTED`；二者都不能绕过 `pfinal` 人工审批直接进入正式 EV。
 
 ## 6. 当前输出与正式执行口径
 

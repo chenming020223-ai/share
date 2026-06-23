@@ -4,9 +4,13 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m worldcup_predictor.web_server
+    startCommand: python -u -m worldcup_predictor.web_server
     healthCheckPath: /healthz
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.15"
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: API_FOOTBALL_KEY
         sync: false
       - key: API_FOOTBALL_RETRIES
@@ -19,6 +23,16 @@ services:
         sync: false
       - key: WORLDCUP_DB_PATH
         value: /opt/render/project/src/storage/worldcup_predictor.sqlite3
+      - key: WORLDCUP_DATA_CACHE_DIR
+        value: /opt/render/project/src/storage/api_cache
+      - key: WORLDCUP_DATA_CACHE_ENABLED
+        value: "true"
+      - key: WORLDCUP_MODEL_VALIDATION_CACHE_SECONDS
+        value: "300"
+      - key: WORLDCUP_AUTO_SETTLEMENT_ENABLED
+        value: "true"
+      - key: WORLDCUP_AUTO_SETTLEMENT_INTERVAL_SECONDS
+        value: "300"
     disk:
       name: worldcup-storage
       mountPath: /opt/render/project/src/storage

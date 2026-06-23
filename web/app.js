@@ -6,6 +6,11 @@ const state = {
   batchHistorySearch: "",
   batchHistoryPage: 1,
   batchHistoryPageSize: 5,
+  historyRuns: [],
+  historyPage: 1,
+  historyPageSize: 8,
+  historyDetailsCache: new Map(),
+  replayCache: new Map(),
   batchFilters: {
     action: "all",
     quality: "all",
@@ -17,8 +22,15 @@ const state = {
     sort: "priority",
   },
   dailyReview: null,
+  loaded: {
+    modelValidation: false,
+    liveReadiness: false,
+    dailyReview: false,
+    paperLedger: false,
+  },
 };
 
+const appShell = document.querySelector(".app-shell");
 const form = document.querySelector("#predictForm");
 const formError = document.querySelector("#formError");
 const statusPill = document.querySelector("#statusPill");
@@ -26,6 +38,7 @@ const homeTeam = document.querySelector("#homeTeam");
 const awayTeam = document.querySelector("#awayTeam");
 const exportExcel = document.querySelector("#exportExcel");
 const exportPdf = document.querySelector("#exportPdf");
+const openTrace = document.querySelector("#openTrace");
 const fixtureResults = document.querySelector("#fixtureResults");
 const batchPoolContent = document.querySelector("#batchPoolContent");
 const batchPoolStatus = document.querySelector("#batchPoolStatus");
@@ -34,10 +47,22 @@ const todayFirstDivision = document.querySelector("#todayFirstDivision");
 const randomToday = document.querySelector("#randomToday");
 const batchToday = document.querySelector("#batchToday");
 const batchFixtureIds = document.querySelector("#batchFixtureIds");
+const historicalPredict = document.querySelector("#historicalPredict");
 const syncResults = document.querySelector("#syncResults");
 const reviewDate = document.querySelector("#reviewDate");
 const loadReview = document.querySelector("#loadReview");
 const exportReviewExcel = document.querySelector("#exportReviewExcel");
+const traceDrawer = document.querySelector("#traceDrawer");
+const traceDrawerContent = document.querySelector("#traceDrawerContent");
+const historyTracePreview = document.querySelector("#historyTracePreview");
+const historyPreviewCrumbs = document.querySelector("#historyPreviewCrumbs");
+const historyRailContent = document.querySelector("#historyRailContent");
+const preMatchCabin = document.querySelector("#preMatchCabin");
+const preMatchCabinStatus = document.querySelector("#preMatchCabinStatus");
+const liveCabin = document.querySelector("#liveCabin");
+const liveCabinStatus = document.querySelector("#liveCabinStatus");
+const historyLedger = document.querySelector("#historyLedger");
+const historyLedgerStatus = document.querySelector("#historyLedgerStatus");
 
 document.querySelectorAll(".view-tab").forEach((button) => {
   button.addEventListener("click", () => setActiveView(button.dataset.view));
@@ -53,9 +78,20 @@ exportPdf.addEventListener("click", () => {
   window.location.href = `/api/report?format=pdf&run_id=${encodeURIComponent(state.currentRunId)}`;
 });
 
+openTrace?.addEventListener("click", () => {
+  if (!state.currentRunId) return;
+  traceDrawer?.classList.remove("is-minimized");
+  setActiveView("dataView");
+  document.querySelector("#dataView")?.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+traceDrawer?.querySelector(".trace-close")?.addEventListener("click", () => {
+  traceDrawer.classList.toggle("is-minimized");
+});
+
 searchFixtures.addEventListener("click", async () => {
   formError.textContent = "";
-  fixtureResults.innerHTML = `<div class="fixture-empty">正在搜索 API-Football 赛程...</div>`;
+  fixtureResults.innerHTML = `<div class="fixture-empty">搜索中...</div>`;
   try {
     const response = await fetch("/api/search-fixtures", {
       method: "POST",
@@ -80,7 +116,7 @@ todayFirstDivision.addEventListener("click", async () => {
   const originalText = todayFirstDivision.textContent;
   todayFirstDivision.disabled = true;
   todayFirstDivision.textContent = "抓取中";
-  fixtureResults.innerHTML = `<div class="fixture-empty">正在抓取北京时间今日甲级联赛...</div>`;
+  fixtureResults.innerHTML = `<div class="fixture-empty">抓取中...</div>`;
   try {
     const response = await fetch("/api/today-fixtures", {
       method: "POST",
@@ -124,6 +160,33 @@ randomToday.addEventListener("click", async () => {
   }
 });
 
+historicalPredict?.addEventListener("click", async () => {
+  formError.textContent = "";
+  const originalText = historicalPredict.textContent;
+  historicalPredict.disabled = true;
+  historicalPredict.textContent = "模拟中";
+  try {
+    const response = await fetch("/api/predict", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...buildPayload(),
+        mode: "historical_asof",
+        historicalAsOf: historicalAsOfValue(),
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw responseError(data, "历史赛前模拟失败");
+    renderPrediction(data);
+    setActiveView("cabinView");
+  } catch (error) {
+    clearPredictionForError(toChineseError(error.message));
+  } finally {
+    historicalPredict.disabled = false;
+    historicalPredict.textContent = originalText;
+  }
+});
+
 batchToday.addEventListener("click", async () => {
   formError.textContent = "";
   const originalText = batchToday.textContent;
@@ -132,8 +195,8 @@ batchToday.addEventListener("click", async () => {
   batchToday.textContent = "批量中";
   fixtureResults.innerHTML = `<div class="fixture-empty">${
     fixtureIds.length
-      ? `正在批量分析指定的 ${fixtureIds.length} 场比赛...`
-      : "正在批量分析北京时间今日甲级联赛前 5 场..."
+      ? `批量中：${fixtureIds.length} 场...`
+      : "批量中：今日前 5 场..."
   }</div>`;
   try {
     const response = await fetch("/api/batch-predict", {
@@ -179,7 +242,7 @@ syncResults.addEventListener("click", async () => {
     const awaiting = data.awaitingCompletion?.length ?? 0;
     const ledgerSettled = data.paperLedger?.settledCount ?? 0;
     document.querySelector("#validationAction").textContent =
-      `同步完成：新增 ${synced} 场赛果，等待完赛 ${awaiting} 场，模拟舱结算 ${ledgerSettled} 条。`;
+      `同步完成：新增 ${synced} · 待完赛 ${awaiting} · 结算 ${ledgerSettled}`;
     renderModelValidation(data.modelValidation || {});
     loadHealth();
     if (state.activeView === "reviewView") loadDailyReview();
@@ -224,13 +287,13 @@ form.addEventListener("submit", async (event) => {
 });
 
 async function init() {
+  appShell?.setAttribute("data-active-view", state.activeView);
   if (reviewDate) reviewDate.value = defaultReviewDate();
   loadHealth();
-  loadModelValidation();
-  loadLiveReadiness();
-  loadHistory();
-  loadRecentBatches();
-  loadDailyReview();
+  window.setTimeout(() => {
+    loadHistory();
+    loadRecentBatches();
+  }, 0);
 }
 
 async function loadHealth() {
@@ -245,7 +308,7 @@ async function loadHealth() {
       ? (publicMode ? "数据源已接入" : "API 已配置")
       : "API 未配置";
     const retryText = data.api?.retries == null ? "" : ` · 自动重试 ${data.api.retries} 次`;
-    document.querySelector("#healthStatus").textContent = `已保存 ${runs} 条预测 · ${apiText}${retryText}`;
+    document.querySelector("#healthStatus").textContent = `${runs} 条预测 · ${apiText}${retryText}`;
     statusPill.textContent = data.api?.configured ? (publicMode ? "在线服务" : "API 已就绪") : "API 待配置";
     statusPill.classList.toggle("offline", !data.api?.configured);
   } catch {
@@ -260,6 +323,7 @@ async function loadModelValidation() {
     const response = await fetch("/api/model-validation");
     const data = await response.json();
     renderModelValidation(data);
+    state.loaded.modelValidation = true;
   } catch {
     document.querySelector("#validationStatus").textContent = "验收状态不可用";
     document.querySelector("#validationMetrics").innerHTML = "";
@@ -272,6 +336,7 @@ async function loadLiveReadiness() {
     const response = await fetch("/api/live-readiness");
     const data = await response.json();
     renderLiveReadiness(data);
+    state.loaded.liveReadiness = true;
   } catch {
     renderLiveReadiness({ statusLabel: "实盘准入不可用", checks: [] });
   }
@@ -294,6 +359,13 @@ function buildPayload() {
   };
 }
 
+function historicalAsOfValue() {
+  const value = document.querySelector("#historicalAsOf")?.value.trim();
+  if (!value) return "";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+}
+
 function renderPrediction(data) {
   const match = data.match;
   const meta = data.meta || {};
@@ -303,11 +375,14 @@ function renderPrediction(data) {
   const qmkt = probabilities.qmkt || probabilities.market || {};
   const governance = data.modelGovernance || {};
 
-  const homeLabel = teamLabel(match, "home");
-  const awayLabel = teamLabel(match, "away");
-  document.querySelector("#matchTitle").textContent = `${homeLabel} vs ${awayLabel}`;
+  document.querySelector("#matchTitle").innerHTML = renderMatchTitle(match);
   document.querySelector("#matchMeta").textContent =
-    [meta.leagueNameZh || meta.leagueName, meta.kickoffBeijing || meta.kickoff, meta.venue]
+    [
+      meta.leagueNameZh || meta.leagueName,
+      meta.kickoffBeijing || meta.kickoff,
+      meta.venue,
+      meta.historicalMode && meta.historicalAsOfBeijing ? `历史模拟截止 ${meta.historicalAsOfBeijing}` : "",
+    ]
       .filter(Boolean)
       .join(" · ") || "实时预测";
   document.querySelector("#dataSource").textContent = meta.dataSource || "-";
@@ -315,6 +390,7 @@ function renderPrediction(data) {
   state.currentRunId = data.runId || null;
   exportExcel.disabled = !state.currentRunId;
   exportPdf.disabled = !state.currentRunId;
+  if (openTrace) openTrace.disabled = !state.currentRunId;
 
   renderProbabilities(match, display);
   document.querySelector("#homeXg").textContent = formatNumber(data.expectedGoals?.home, 2);
@@ -326,11 +402,22 @@ function renderPrediction(data) {
   renderPortfolio(data.portfolio || {});
   renderRecommendations(data.recommendations || []);
   renderLiveReadiness(data.liveReadiness || {});
-  renderDataProcessing(data.dataProcessing || {});
+  renderDataProcessing(data.dataProcessing || {}, data);
+  renderTraceDrawer(data);
+  renderHistoryTracePreview(data, "当前单场");
   renderNotes(data.notes || []);
-  loadHealth();
-  loadModelValidation();
-  loadHistory();
+  if (data.modelValidation) {
+    renderModelValidation(data.modelValidation);
+    state.loaded.modelValidation = true;
+  }
+  if (data.liveReadiness) {
+    state.loaded.liveReadiness = true;
+  }
+  window.setTimeout(() => {
+    loadHealth();
+    loadHistory();
+    if (state.activeView === "cabinView") loadPaperLedgerBook();
+  }, 0);
 }
 
 function renderFixtureResults(fixtures, message = "") {
@@ -342,18 +429,17 @@ function renderFixtureResults(fixtures, message = "") {
     `;
     return;
   }
-  const summary = message ? `<div class="fixture-empty">${escapeHtml(message)}请选择一场后点击“生成赛前分析”。</div>` : "";
+  const summary = message ? `<div class="fixture-empty">${escapeHtml(message)}</div>` : "";
   fixtureResults.innerHTML = summary + fixtures
     .map((item) => {
       const home = item.homeZh || item.home || "-";
       const away = item.awayZh || item.away || "-";
-      const title = `${home} vs ${away}`;
       const meta = [`ID ${item.fixtureId}`, item.dateBeijing || item.date, item.leagueZh || item.league, item.status]
         .filter(Boolean)
         .join(" · ");
       return `
         <div class="fixture-option fixture-card" data-fixture-id="${escapeHtml(item.fixtureId)}" data-home="${escapeHtml(home)}" data-away="${escapeHtml(away)}">
-          <strong>${escapeHtml(title)}</strong>
+          <strong>${teamPairHtml(home, away, item.homeLogo || item.home_logo, item.awayLogo || item.away_logo)}</strong>
           <span>${escapeHtml(meta)}</span>
           <div class="fixture-actions">
             <button class="mini-action select-single" type="button">单场分析</button>
@@ -373,7 +459,7 @@ function renderFixtureResults(fixtures, message = "") {
       const title = `${card.dataset.home || "-"} vs ${card.dataset.away || "-"}`;
       fixtureResults.innerHTML = `
         <div class="fixture-empty">
-          已选择 ${escapeHtml(title)}（比赛 ID ${escapeHtml(card.dataset.fixtureId || "-")}）。点击“生成赛前分析”继续。
+          已选择 ${escapeHtml(title)} · ID ${escapeHtml(card.dataset.fixtureId || "-")}
         </div>
       `;
       formError.textContent = "";
@@ -398,9 +484,8 @@ function renderBatchResult(data) {
   const plan = summary.portfolioPlan || {};
   const collectedItems = current.collected || [];
   const failedItems = current.failed || [];
-  normalizeBatchFilters(collectedItems, failedItems);
-  const filteredCollected = filterBatchCollected(collectedItems, plan);
-  const filteredFailed = filterBatchFailed(failedItems);
+  const filteredCollected = sortBatchItems(collectedItems, "priority");
+  const filteredFailed = failedItems;
   const visibleCount = filteredCollected.length + filteredFailed.length;
   const totalCount = summary.total ?? (collectedItems.length + failedItems.length);
   const summaryCards = [
@@ -421,23 +506,17 @@ function renderBatchResult(data) {
     .join("");
   const rows = filteredCollected
     .map((item) => `
-      <div class="batch-pool-row ${plan.selectedRunIds?.includes(item.runId) ? "planned" : ""}">
+      <div class="batch-pool-row ${plan.selectedRunIds?.includes(item.runId) ? "planned" : ""}" data-run-card="${escapeHtml(item.runId)}">
         <div class="batch-main">
-          <strong>${escapeHtml(`${item.home || "主队"} vs ${item.away || "客队"}`)}</strong>
+          <strong>${teamPairHtml(item.home || "主队", item.away || "客队", item.homeLogo || item.home_logo, item.awayLogo || item.away_logo)}</strong>
           <span>运行 ${escapeHtml(item.runId)} · ID ${escapeHtml(item.fixtureId || "-")} · ${escapeHtml(item.league || "-")} · ${escapeHtml(item.kickoffBeijing || "-")}</span>
         </div>
         <span class="history-signal ${historyActionClass(item.signalStatus || item.recommendationAction)}">${escapeHtml(actionLabel(item.signalStatus || item.recommendationAction))}</span>
-        <div class="batch-insights">
-          <span><b>预测</b>${escapeHtml(item.predictionLabel || "-")} ${formatPercent(item.predictionProbability)}</span>
-          <span><b>模拟舱</b>${escapeHtml(item.recommendationSummary || "-")}</span>
-          <span><b>质量</b>${escapeHtml(item.qualityLabel || "-")} · 盘口 ${escapeHtml(item.availableMarkets ?? 0)}/${escapeHtml(item.totalMarkets ?? 0)}</span>
-          <span><b>EV</b>${formatBatchEv(item)}</span>
-          <span><b>资金</b>占用 ${formatMoney(item.totalStake)} · 期望 ${formatMoney(item.expectedBankroll)}</span>
-          <span><b>庄家</b>${escapeHtml(formatBookmakerSummary(item))}</span>
-        </div>
+        <div class="run-result-grid">${renderRunResultBlocks(null, item)}</div>
         <p class="batch-reason">${escapeHtml(item.recommendationReason || item.gateLabel || "等待进一步复核。")}</p>
         <div class="batch-actions">
           <button class="mini-action open-run" type="button" data-run-id="${escapeHtml(item.runId)}">查看单场</button>
+          <button class="mini-action open-trace" type="button" data-run-id="${escapeHtml(item.runId)}">回溯数据</button>
           <a class="history-link" href="/api/report?format=xlsx&amp;run_id=${encodeURIComponent(item.runId)}">Excel</a>
           <a class="history-link" href="/api/report?format=pdf&amp;run_id=${encodeURIComponent(item.runId)}">PDF</a>
         </div>
@@ -448,7 +527,7 @@ function renderBatchResult(data) {
     .map((item) => `
       <div class="batch-pool-row failed">
         <div class="batch-main">
-          <strong>${escapeHtml(`${item.home || "主队"} vs ${item.away || "客队"}`)}</strong>
+          <strong>${teamPairHtml(item.home || "主队", item.away || "客队", item.homeLogo || item.home_logo, item.awayLogo || item.away_logo)}</strong>
           <span>ID ${escapeHtml(item.fixtureId || "-")} · ${escapeHtml(item.league || "-")} · ${escapeHtml(item.kickoffBeijing || "-")}</span>
         </div>
         <span class="history-signal no-market">${escapeHtml(item.failureLabel || "失败")}</span>
@@ -457,18 +536,9 @@ function renderBatchResult(data) {
     `)
     .join("");
   const contentHtml = `
-    <div class="fixture-empty batch-result-intro">
-      <span>
-        ${escapeHtml(current.message || "批量分析完成")} ${current.fixtureIds?.length ? `指定 ID ${escapeHtml(current.fixtureIds.join("、"))}。` : ""}逻辑请求 ${escapeHtml(request.logical ?? 0)}，HTTP ${escapeHtml(request.httpAttempts ?? 0)}，缓存命中 ${escapeHtml(request.cacheHits ?? 0)}。
-        <br>${escapeHtml(summary.bankrollMode || "批量总览仅用于研究排序。")}
-      </span>
-      <button class="mini-action show-batch-history" type="button">查看历史批次</button>
-      ${current.batchRunId ? `<button class="mini-action mark-current-official" type="button" data-batch-id="${escapeHtml(current.batchRunId)}" data-date="${escapeHtml(current.date || "")}">设为官方批次</button>` : ""}
-    </div>
     <div class="batch-summary-grid">${summaryCards}</div>
-    ${renderBatchControls(collectedItems, failedItems)}
     ${renderBatchPortfolioPlan(plan)}
-    ${rows || (filteredFailed.length ? "" : `<div class="fixture-empty">当前筛选条件下没有匹配的成功比赛。</div>`)}
+    ${rows || (filteredFailed.length ? "" : `<div class="fixture-empty">当前批次没有可展示的成功比赛。</div>`)}
     ${failed || ""}
   `;
   const target = batchPoolContent || fixtureResults;
@@ -480,7 +550,7 @@ function renderBatchResult(data) {
   if (batchPoolContent) {
     fixtureResults.innerHTML = `
       <div class="fixture-empty">
-        批量赛事池已生成：成功 ${escapeHtml(summary.success ?? 0)} 场，信号 ${escapeHtml(summary.signalCount ?? 0)} 个，失败 ${escapeHtml(summary.failed ?? 0)} 场。请打开“批量赛事池”查看筛选、排序和组合预案。
+        批量完成：成功 ${escapeHtml(summary.success ?? 0)} · 信号 ${escapeHtml(summary.signalCount ?? 0)} · 失败 ${escapeHtml(summary.failed ?? 0)}
       </div>
     `;
   }
@@ -499,6 +569,10 @@ function renderBatchResult(data) {
   target.querySelectorAll(".open-run").forEach((button) => {
     button.addEventListener("click", () => loadPredictionRun(button.dataset.runId));
   });
+  target.querySelectorAll(".open-trace").forEach((button) => {
+    button.addEventListener("click", () => loadPredictionRun(button.dataset.runId, "dataView"));
+  });
+  hydrateRunCards(filteredCollected);
 }
 
 function renderBatchControls(collectedItems = [], failedItems = []) {
@@ -856,15 +930,18 @@ function batchEvValue(item) {
   return -99;
 }
 
-async function loadPredictionRun(runId) {
+async function loadPredictionRun(runId, targetView = "workbenchView") {
   if (!runId) return;
   formError.textContent = "";
   try {
     const response = await fetch(`/api/prediction?run_id=${encodeURIComponent(runId)}`);
     const data = await response.json();
     if (!response.ok) throw responseError(data, "读取单场记录失败");
+    state.historyDetailsCache.set(String(runId), data);
     renderPrediction(data);
-    setActiveView("workbenchView");
+    setActiveView(targetView);
+    const scrollTarget = targetView === "workbenchView" ? ".match-context" : `#${targetView}`;
+    document.querySelector(scrollTarget)?.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     formError.textContent = toChineseError(error.message);
   }
@@ -875,6 +952,7 @@ function clearPredictionForError(message) {
   state.currentRunId = null;
   exportExcel.disabled = true;
   exportPdf.disabled = true;
+  if (openTrace) openTrace.disabled = true;
   document.querySelector("#matchTitle").textContent = "预测失败";
   document.querySelector("#matchMeta").textContent = "请搜索比赛、选择比赛 ID，或换一场今日比赛。";
   document.querySelector("#dataSource").textContent = "API 未完成";
@@ -892,21 +970,27 @@ function clearPredictionForError(message) {
   document.querySelector("#portfolioSummary").textContent = "";
   document.querySelector("#recommendations").innerHTML = "";
   renderDataProcessing({});
+  if (traceDrawerContent) {
+    traceDrawerContent.innerHTML = `<div class="panel-placeholder">暂无回溯</div>`;
+  }
+  if (historyTracePreview) {
+    historyTracePreview.innerHTML = `<div class="panel-placeholder">暂无回溯</div>`;
+  }
   renderNotes([message]);
 }
 
 function renderProbabilities(match, final) {
   const rows = [
-    [teamLabel(match, "home"), final.home_win],
+    [teamLabelHtml(match, "home"), final.home_win],
     ["平局", final.draw],
-    [teamLabel(match, "away"), final.away_win],
+    [teamLabelHtml(match, "away"), final.away_win],
   ];
   document.querySelector("#probabilityGrid").innerHTML = rows
     .map(([label, value]) => {
       const pct = clamp((value || 0) * 100, 0, 100);
       return `
         <article class="prob-card">
-          <strong>${escapeHtml(label)}</strong>
+          <strong>${label}</strong>
           <div class="prob-value">${formatPercent(value)}</div>
           <div class="prob-track"><div class="prob-fill" style="width:${pct}%"></div></div>
         </article>
@@ -924,9 +1008,9 @@ function renderScores(scores) {
 
 function renderMarketTable(match, display, pbase, qmkt, governance) {
   const rows = [
-    [teamLabel(match, "home"), display.home_win, pbase.home_win, qmkt?.home_win],
+    [teamLabelHtml(match, "home"), display.home_win, pbase.home_win, qmkt?.home_win],
     ["平局", display.draw, pbase.draw, qmkt?.draw],
-    [teamLabel(match, "away"), display.away_win, pbase.away_win, qmkt?.away_win],
+    [teamLabelHtml(match, "away"), display.away_win, pbase.away_win, qmkt?.away_win],
   ];
   document.querySelector("#bookmakerCount").textContent = governance.gateLabel || "";
   document.querySelector("#marketTable").classList.remove("table-idle");
@@ -938,7 +1022,7 @@ function renderMarketTable(match, display, pbase, qmkt, governance) {
       .map(
         ([label, displayValue, pbaseValue, qmktValue]) => `
           <div class="table-row">
-            <div>${escapeHtml(label)}</div>
+            <div>${label}</div>
             <div>${formatPercent(displayValue)}</div>
             <div>${formatPercent(pbaseValue)}</div>
             <div>${qmktValue == null ? "-" : formatPercent(qmktValue)}</div>
@@ -964,10 +1048,7 @@ function renderModelAudit(audit) {
 }
 
 function renderPortfolio(portfolio) {
-  const unit = portfolio.suggested_unit_stake ?? portfolio.unit_stake;
-  const cash = portfolio.cash ?? portfolio.bankroll;
-  document.querySelector("#portfolioSummary").textContent =
-    `资金 ${formatMoney(portfolio.bankroll)} · 现金 ${formatMoney(cash)} · 单注 ${formatMoney(unit)} · 占用 ${formatMoney(portfolio.total_stake)} · 期望 ${formatMoney(portfolio.expected_bankroll)}`;
+  document.querySelector("#portfolioSummary").textContent = "";
 }
 
 function renderRecommendations(items) {
@@ -977,8 +1058,6 @@ function renderRecommendations(items) {
       const suspended =
         signalStatus === "SUSPENDED" ||
         ["SUSPENDED_MODEL_DIVERGENCE", "MODEL_MARKET_CONFLICT", "SUSPENDED"].includes(item.ev_status);
-      const actionClass = historyActionClass(signalStatus);
-      const displayAction = item.publicActionLabel || actionLabel(item.publicAction || signalStatus);
       const researchEv = suspended ? null : item.ev_pbase_research ?? item.audit_expected_value_per_unit ?? item.expected_value_per_unit;
       const paperEv = suspended
         ? null
@@ -988,11 +1067,8 @@ function renderRecommendations(items) {
           item.audit_paper_expected_value_per_unit ??
           item.audit_conservative_expected_value_per_unit ??
           item.conservative_expected_value_per_unit;
-      const formalEv = item.ev_pfinal_exec;
       const scoreResearchOnly = item.ev_calculation?.evDecisionLayer === "research_audit_only";
-      const pAdj = item.adjusted_probability;
-      const shrinkK = item.shrink_k;
-      const decisionStatus = item.decision_status || item.ev_status || signalStatus;
+      const displayEv = scoreResearchOnly ? researchEv : paperEv ?? researchEv;
       const probabilityLabel = item.model_probability_label || (item.market === "胜平负" ? "模型胜率" : "正收益概率");
       const marketProbabilityLabel = item.market === "胜平负" ? "市场胜率" : "市场概率";
       const probabilityGap = item.edge == null ? null : Number(item.edge);
@@ -1003,18 +1079,12 @@ function renderRecommendations(items) {
             <strong>${escapeHtml(item.market)}</strong>
             <span>${escapeHtml(item.selection)}</span>
           </div>
-          <span class="action ${actionClass}">${escapeHtml(displayAction)}</span>
           <div class="rec-metrics">
             <span>赔率 <strong>${item.odds == null ? "-" : formatNumber(item.odds, 2)}</strong></span>
             <span>${escapeHtml(probabilityLabel)} <strong>${formatPercent(item.model_probability)}</strong></span>
             <span>${escapeHtml(marketProbabilityLabel)} <strong>${item.market_probability == null ? "-" : formatPercent(item.market_probability)}</strong></span>
             <span>模型-市场差 <strong class="${gapClass}">${probabilityGap == null ? "-" : formatPercent(probabilityGap)}</strong></span>
-            <span>p_adj <strong>${scoreResearchOnly ? "未开放" : pAdj == null ? "-" : formatPercent(pAdj)}</strong></span>
-            <span>shrink_k <strong>${scoreResearchOnly ? "未开放" : shrinkK == null ? "-" : formatNumber(shrinkK, 2)}</strong></span>
-            <span>研究EV(pbase) <strong>${suspended ? "已暂停" : researchEv == null ? "-" : formatPercent(researchEv)}</strong></span>
-            <span>纸上EV(p_adj) <strong>${suspended ? "已暂停" : scoreResearchOnly ? "未开放" : paperEv == null ? "-" : formatPercent(paperEv)}</strong></span>
-            <span>正式EV(pfinal) <strong>${formalEv == null ? "未开放" : formatPercent(formalEv)}</strong></span>
-            <span>决策状态 <strong>${escapeHtml(decisionLabel(decisionStatus))}</strong></span>
+            <span>EV <strong>${suspended ? "已暂停" : displayEv == null ? "-" : formatPercent(displayEv)}</strong></span>
           </div>
           ${renderEvCalculation(item.ev_calculation, suspended, signalStatus)}
           <p class="rec-reason">${escapeHtml(item.reason || "")}</p>
@@ -1024,53 +1094,34 @@ function renderRecommendations(items) {
     .join("");
 }
 
-function renderEvCalculation(calc, suspended, signalStatus) {
-  if (suspended) {
-    return `
-      <div class="ev-path ev-suspended">
-        <strong>EV 路径已暂停</strong>
-        <span>${signalStatus === "SUSPENDED" ? "数据质量、近期样本或模型分歧未通过闸门，本场不允许进入模拟资金。" : "基础模型与市场基准分歧超限，本场不允许进入模拟资金。"}</span>
-      </div>
-    `;
+function formatEvLayer(layer, fallbackValue, fallbackLabel = "-") {
+  if (layer) {
+    if (layer.value != null) return formatPercent(layer.value);
+    return escapeHtml(layer.statusLabel || fallbackLabel);
   }
-  if (!calc || !calc.formula) return "";
+  return fallbackValue == null ? escapeHtml(fallbackLabel) : formatPercent(fallbackValue);
+}
 
-  const formula = calc.type === "1X2"
-    ? `${formatPercent(calc.modelProbability)} × ${formatNumber(calc.odds, 2)} - 1 = ${formatPercent(calc.expectedValue)}`
-    : `${formatNumber(calc.winStakeFraction, 3)} × (${formatNumber(calc.odds, 2)} - 1) - ${formatNumber(calc.lossStakeFraction, 3)} = ${formatPercent(calc.expectedValue)}`;
-  const paperLine = calc.evDecisionLayer === "research_audit_only"
-    ? `<div class="ev-line"><strong>纸上EV</strong><span>${escapeHtml(calc.paperFormula || "比分分布层未完成独立校准，paper_EV 暂不开放。")}</span></div>`
-    : calc.paperExpectedValue == null
-    ? ""
-    : `<div class="ev-line"><strong>纸上EV</strong><span>p_adj ${formatPercent(calc.adjustedProbability)}，shrink_k ${formatNumber(calc.shrinkK, 2)}；${escapeHtml(calc.paperFormula || "paper_EV = p_adj × odds - 1")}；结果 ${formatPercent(calc.paperExpectedValue)}</span></div>`;
-  const expanded = calc.type === "1X2"
-    ? `展开：(${formatNumber(calc.odds, 2)} - 1) × ${formatPercent(calc.modelProbability)} - ${formatPercent(calc.lossStakeFraction)}`
-    : `盈亏权重：正收益概率 ${formatPercent(calc.positiveReturnProbability)}，盈利注权重 ${formatNumber(calc.winStakeFraction, 3)}，亏损注权重 ${formatNumber(calc.lossStakeFraction, 3)}，盈亏平衡赔率 ${calc.breakEvenOdds == null ? "-" : formatNumber(calc.breakEvenOdds, 2)}`;
-  const settlement = calc.settlement
-    ? `
-      <div class="settlement-grid">
-        <span>全赢 ${formatPercent(calc.settlement.fullWinProbability)}</span>
-        <span>半赢 ${formatPercent(calc.settlement.halfWinProbability)}</span>
-        <span>走水 ${formatPercent(calc.settlement.pushProbability)}</span>
-        <span>半输 ${formatPercent(calc.settlement.halfLossProbability)}</span>
-        <span>全输 ${formatPercent(calc.settlement.fullLossProbability)}</span>
-      </div>
-    `
-    : "";
-  const gates = (calc.gates || [])
+function renderEvCalculation(calc, suspended, signalStatus) {
+  const gates = (calc?.gates || [])
     .map((gate) => `
       <span class="gate-pill ${gate.passed ? "pass" : "fail"}">
         ${escapeHtml(gate.label)} ${gate.passed ? "通过" : "未过"}
       </span>
     `)
     .join("");
-
+  if (suspended) {
+    return `
+      <div class="ev-path ev-suspended">
+        <strong>EV 路径已暂停</strong>
+        <span>${signalStatus === "SUSPENDED" ? "闸门未过" : "模型与市场冲突"}</span>
+        ${gates ? `<div class="gate-list">${gates}</div>` : ""}
+      </div>
+    `;
+  }
+  if (!calc || !gates) return "";
   return `
-    <div class="ev-path">
-      <div class="ev-line"><strong>研究EV</strong><span>${escapeHtml(calc.formula)}；${escapeHtml(formula)}</span></div>
-      ${paperLine}
-      <div class="ev-line"><strong>复核</strong><span>${escapeHtml(expanded)}；P_display 不参与 EV，formal_EV 当前未开放。</span></div>
-      ${settlement}
+    <div class="ev-path ev-gates-only">
       <div class="gate-list">${gates}</div>
     </div>
   `;
@@ -1126,30 +1177,46 @@ function renderNotes(notes) {
 
 function setActiveView(viewId) {
   state.activeView = viewId;
+  appShell?.setAttribute("data-active-view", viewId);
   document.querySelectorAll(".view-tab").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === viewId);
   });
   document.querySelectorAll(".content-view").forEach((view) => {
     view.classList.toggle("active", view.id === viewId);
   });
+  if (viewId === "cabinView") {
+    loadPaperLedgerBook();
+  }
+  if (viewId === "auditView") {
+    if (!state.loaded.modelValidation) loadModelValidation();
+    if (!state.loaded.liveReadiness) loadLiveReadiness();
+  }
+  if (viewId === "reviewView" && !state.loaded.dailyReview) {
+    loadDailyReview();
+  }
+  if (viewId === "batchView" && !state.recentBatches.length) {
+    loadRecentBatches();
+  }
 }
 
-function renderDataProcessing(processing) {
+function renderDataProcessing(processing, data = {}) {
   const home = processing.home || {};
   const away = processing.away || {};
   const populated = Boolean(home.matches?.length || away.matches?.length);
   const coverage = document.querySelector("#dataCoverage");
   if (!populated) {
-    coverage.textContent = "等待生成分析";
+    coverage.textContent = "等待分析";
     coverage.classList.remove("insufficient");
-    document.querySelector("#processingSteps").innerHTML = `<div class="panel-placeholder">等待真实数据</div>`;
-    document.querySelector("#processingMetrics").innerHTML = `<div class="panel-placeholder">等待真实数据</div>`;
+    document.querySelector("#processingSteps").innerHTML = `<div class="panel-placeholder">等待数据</div>`;
+    document.querySelector("#processingMetrics").innerHTML = `<div class="panel-placeholder">等待数据</div>`;
+    const expAudit = document.querySelector("#expEdgeAudit");
+    if (expAudit) expAudit.innerHTML = "";
     renderLineChart("#homeFormChart", [], []);
     renderLineChart("#awayFormChart", [], []);
     renderLineChart("#portfolioTrendChart", [], []);
-    document.querySelector("#homeRecentTable").innerHTML = `<div class="panel-placeholder">等待真实数据</div>`;
-    document.querySelector("#awayRecentTable").innerHTML = `<div class="panel-placeholder">等待真实数据</div>`;
-    document.querySelector("#oddsTrendNotice").textContent = "生成分析后检查是否具备多个赛前赔率快照。";
+    document.querySelector("#homeRecentTable").innerHTML = `<div class="panel-placeholder">等待数据</div>`;
+    document.querySelector("#awayRecentTable").innerHTML = `<div class="panel-placeholder">等待数据</div>`;
+    document.querySelector("#oddsTrendNotice").textContent = "生成后检查快照。";
     return;
   }
 
@@ -1167,6 +1234,8 @@ function renderDataProcessing(processing) {
     `)
     .join("");
   document.querySelector("#processingMetrics").innerHTML = renderProcessingMetrics(home, away);
+  const expAudit = document.querySelector("#expEdgeAudit");
+  if (expAudit) expAudit.innerHTML = renderExpEdgeAudit(data);
 
   document.querySelector("#homeChartTitle").textContent = `${home.displayName || "主队"} · 进球与失球`;
   document.querySelector("#awayChartTitle").textContent = `${away.displayName || "客队"} · 进球与失球`;
@@ -1191,7 +1260,7 @@ function renderDataProcessing(processing) {
   renderRecentTable("#homeRecentTable", home.matches || []);
   renderRecentTable("#awayRecentTable", away.matches || []);
   document.querySelector("#oddsTrendNotice").textContent =
-    processing.oddsTrend?.message || "当前缺少可验证的连续赔率快照。";
+    processing.oddsTrend?.message || "缺少连续赔率快照。";
 }
 
 function renderProcessingMetrics(home, away) {
@@ -1221,6 +1290,90 @@ function renderProcessingMetrics(home, away) {
         <div class="metric-cell value">${escapeHtml(awayValue)}</div>
       `)
       .join("")}
+  `;
+}
+
+function renderExpEdgeAudit(data) {
+  const expected = data.expectedGoals || {};
+  const edges = data.featureEdges || {};
+  if (expected.logEdge == null && !Object.keys(edges).length) return "";
+  const match = data.match || {};
+  const homeName = teamLabel(match, "home");
+  const awayName = teamLabel(match, "away");
+  const componentKeys = [
+    "elo_edge",
+    "fifa_rank_edge",
+    "host_edge",
+    "rest_edge",
+    "travel_edge",
+    "group_context_edge",
+    "rotation_edge",
+    "h2h_edge",
+    "country_relation_edge",
+    "commercial_incentive_edge",
+  ];
+  const labels = {
+    elo_edge: "Elo 强度差",
+    fifa_rank_edge: "FIFA 排名差",
+    host_edge: "主场/中立场",
+    rest_edge: "休息天数",
+    travel_edge: "旅行距离",
+    group_context_edge: "积分/战意",
+    rotation_edge: "轮换风险",
+    h2h_edge: "历史交锋",
+    country_relation_edge: "国家关系",
+    commercial_incentive_edge: "商业动机",
+  };
+  const rows = componentKeys.map((key) => {
+    const value = Number(edges[key] || 0);
+    return {
+      key,
+      label: labels[key] || key,
+      value,
+      side: value > 0 ? homeName : value < 0 ? awayName : "中性",
+    };
+  });
+  const fallbackLogEdge = rows.reduce((sum, row) => sum + row.value, 0);
+  const logEdge = Number.isFinite(Number(expected.logEdge)) ? Number(expected.logEdge) : fallbackLogEdge;
+  const homeMultiplier = Number.isFinite(Number(expected.homeExpMultiplier)) ? Number(expected.homeExpMultiplier) : Math.exp(logEdge);
+  const awayMultiplier = Number.isFinite(Number(expected.awayExpMultiplier)) ? Number(expected.awayExpMultiplier) : Math.exp(-logEdge);
+  const drawBoost = Number(edges.rivalry_draw_boost || 0);
+  return `
+    <div class="exp-audit-card">
+      <div class="exp-audit-head">
+        <div>
+          <p class="eyebrow">模型公式</p>
+          <h3>综合优势 exp 计算</h3>
+        </div>
+        <span>${escapeHtml(logEdge >= 0 ? `${homeName} 优势` : `${awayName} 优势`)}</span>
+      </div>
+      <div class="exp-formula-flow">
+        <span>基础 λ ${escapeHtml(homeName)} ${formatNumber(expected.baseHome, 2)} / ${escapeHtml(awayName)} ${formatNumber(expected.baseAway, 2)}</span>
+        <b>×</b>
+        <span>log_edge ${formatSignedNumber(logEdge, 3)}</span>
+        <b>=</b>
+        <span>exp 倍率 ${formatNumber(homeMultiplier, 3)} / ${formatNumber(awayMultiplier, 3)}</span>
+        <b>→</b>
+        <span>修正 λ ${formatNumber(expected.rawHome, 2)} / ${formatNumber(expected.rawAway, 2)}</span>
+        <b>→</b>
+        <span>最终 λ ${formatNumber(expected.home, 2)} / ${formatNumber(expected.away, 2)}</span>
+      </div>
+      <div class="exp-component-grid">
+        ${rows
+          .map((row) => `
+            <div class="exp-component ${row.value > 0 ? "positive" : row.value < 0 ? "negative" : ""}">
+              <span>${escapeHtml(row.label)}</span>
+              <strong>${formatSignedNumber(row.value, 3)}</strong>
+              <small>${escapeHtml(row.side)}</small>
+            </div>
+          `)
+          .join("")}
+      </div>
+      <div class="exp-audit-note">
+        <strong>计算口径</strong>
+        <span>主队 λ = 基础 λ × exp(log_edge)，客队 λ = 基础 λ × exp(-log_edge)。宿敌/历史关系中的平局增强单独进入平局概率，本场 draw_boost ${formatSignedNumber(drawBoost, 3)}。风险收缩 factor ${formatNumber(expected.lambdaShrinkFactor, 2)}。</span>
+      </div>
+    </div>
   `;
 }
 
@@ -1311,12 +1464,13 @@ async function loadDailyReview() {
   const date = reviewDate?.value || defaultReviewDate();
   if (reviewDate && !reviewDate.value) reviewDate.value = date;
   const status = document.querySelector("#reviewStatus");
-  if (status) status.textContent = "正在读取复盘";
+  if (status) status.textContent = "读取中";
   try {
     const response = await fetch(`/api/daily-review?date=${encodeURIComponent(date)}`);
     const data = await response.json();
     if (!response.ok) throw responseError(data, "读取复盘失败");
     state.dailyReview = data;
+    state.loaded.dailyReview = true;
     renderDailyReview(data);
   } catch (error) {
     if (status) status.textContent = toChineseError(error.message);
@@ -1370,7 +1524,7 @@ function renderMarketLineBacktest(backtest) {
     `${summary.settledCandidates ?? 0} 条已结算候选 · ${escapeHtml(summary.approvalLabel || "仅供研究")}`;
   const container = document.querySelector("#marketLineBacktest");
   if (!lineGroups.length && !marketGroups.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无已结算大小球/让球候选。同步赛果后会按盘口线统计。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无盘口样本</div>`;
     return;
   }
   const marketChips = marketGroups.slice(0, 3)
@@ -1409,7 +1563,7 @@ function renderScoreDistributionBacktest(backtest) {
   const container = document.querySelector("#scoreDistributionBacktest");
   if (!container) return;
   if (!scoreRows.length && !marketRows.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无比分分布审计。同步赛果后会重建 pbase 比分矩阵。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无比分审计</div>`;
     return;
   }
   const summaryChips = [
@@ -1442,9 +1596,9 @@ function renderScoreDistributionBacktest(backtest) {
   container.innerHTML = `
     <div class="anomaly-groups">${summaryChips}</div>
     <div class="review-row score-dist header"><span>比分偏差</span><span>预期总进球</span><span>偏差</span><span>实际比分概率</span></div>
-    ${scoreList || `<div class="panel-placeholder">暂无比分偏差样本。</div>`}
+    ${scoreList || `<div class="panel-placeholder">暂无比分样本</div>`}
     <div class="review-row score-market header"><span>盘口归因</span><span>赢亏权重</span><span>正收益概率</span><span>实际盈亏</span></div>
-    ${marketList || `<div class="panel-placeholder">暂无盘口归因样本。</div>`}
+    ${marketList || `<div class="panel-placeholder">暂无盘口样本</div>`}
   `;
 }
 
@@ -1455,7 +1609,7 @@ function renderReviewBankroll(timeline) {
     `现金 ${formatMoney(summary.cash)} · 预留 ${formatMoney(summary.reservedStake)} · ${escapeHtml(summary.riskLabel || "正常")}`;
   const container = document.querySelector("#reviewBankroll");
   if (!events.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无纸上观察资金事件。正式 EV 未开放时这里保持空账本，是正常状态。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无资金事件</div>`;
     return;
   }
   const recent = [...events].slice(-10).reverse();
@@ -1477,7 +1631,7 @@ function renderReviewBankroll(timeline) {
 function renderReviewAnomalies(rows, groups) {
   const container = document.querySelector("#reviewAnomalies");
   if (!rows.length && !groups.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无高 EV 异常。后续同步赛果后，会按市场、赔率区间和模型分歧自动归因。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无高 EV 异常</div>`;
     return;
   }
   const groupRows = (groups || []).slice(0, 5)
@@ -1508,7 +1662,7 @@ function renderReviewAnomalies(rows, groups) {
 function renderReviewSettled(rows) {
   const container = document.querySelector("#reviewSettled");
   if (!rows.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无已结算比赛。先同步赛果后再复盘。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无已结算比赛</div>`;
     return;
   }
   container.innerHTML = `
@@ -1535,7 +1689,7 @@ function renderReviewEv(rows) {
     .sort((a, b) => Number(b.expectedValue || 0) - Number(a.expectedValue || 0))
     .slice(0, 12);
   if (!settled.length) {
-    container.innerHTML = `<div class="panel-placeholder">暂无已结算 EV 候选。同步赛果后会显示高 EV 是否失真。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无 EV 结算</div>`;
     return;
   }
   container.innerHTML = `
@@ -1556,7 +1710,7 @@ function renderReviewEv(rows) {
 function renderReviewPending(rows) {
   const container = document.querySelector("#reviewPending");
   if (!rows.length) {
-    container.innerHTML = `<div class="panel-placeholder">当前复盘日期没有待结算比赛。</div>`;
+    container.innerHTML = `<div class="panel-placeholder">暂无待结算</div>`;
     return;
   }
   container.innerHTML = `
@@ -1580,10 +1734,353 @@ async function loadHistory() {
     const data = await response.json();
     renderHistory(data.runs || []);
     renderBankrollTrend(data.runs || []);
+    if (state.activeView === "cabinView") loadPaperLedgerBook();
   } catch {
     document.querySelector("#historyList").innerHTML = `<div class="panel-placeholder">本地记录读取失败</div>`;
     renderBankrollTrend([]);
+    if (state.activeView === "cabinView") renderPaperLedgerBook({});
   }
+}
+
+async function loadHistoryReplayLedger() {
+  try {
+    const response = await fetch("/api/history-replay-ledger");
+    const data = await response.json();
+    if (!response.ok) throw responseError(data, "读取历史回放账本失败");
+    renderHistoryReplayLedger(data);
+  } catch (error) {
+    renderHistoryReplayLedger({ error: toChineseError(error.message) });
+  }
+}
+
+function renderHistoryReplayLedger(ledger = {}) {
+  const status = document.querySelector("#historyReplayStatus");
+  if (ledger.error) {
+    if (status) status.textContent = "回放读取失败";
+    renderBankrollTrend([]);
+    renderHistoryReplayRows([], ledger.error);
+    return;
+  }
+  const original = ledger.modes?.original || {};
+  const current = ledger.modes?.current || {};
+  const originalSummary = original.summary || {};
+  const currentSummary = current.summary || {};
+  if (status) {
+    status.textContent =
+      `已结算 ${ledger.settledRuns ?? 0} 场 · 去重 ${ledger.duplicatesExcluded ?? 0} · 当前规则 ${formatSignedMoney(currentSummary.totalProfit || 0)}`;
+  }
+  const originalTimeline = original.timeline || [];
+  const currentTimeline = current.timeline || [];
+  const labels = longerTimelineLabels(originalTimeline, currentTimeline);
+  const series = [
+    { values: originalTimeline.map((item) => Number(item.bankroll || 0)), color: "#f26a21" },
+    { values: currentTimeline.map((item) => Number(item.bankroll || 0)), color: "#7ca8ee" },
+  ];
+  renderLineChart("#historyBankrollChart", labels, series, { baselineZero: false });
+  renderHistoryReplayRows(ledger.rows || [], ledger.notes?.[0]);
+}
+
+function longerTimelineLabels(first = [], second = []) {
+  const timeline = first.length >= second.length ? first : second;
+  return timeline.map((item, index) => index === 0 ? "起始" : String(item.label || `#${index}`));
+}
+
+function renderHistoryReplayRows(rows = [], note = "") {
+  const container = document.querySelector("#historyReplayLedger");
+  if (!container) return;
+  const visibleRows = [...rows].slice(-6).reverse();
+  if (!visibleRows.length) {
+    container.innerHTML = `<div class="panel-placeholder">${escapeHtml(note || "暂无回放样本")}</div>`;
+    return;
+  }
+  container.innerHTML = visibleRows
+    .map((row) => {
+      const original = row.original || {};
+      const current = row.current || {};
+      return `
+        <button class="history-replay-row" type="button" data-run-id="${escapeHtml(row.runId || "")}">
+          <span class="history-replay-match">
+            <strong>${teamPairHtml(row.home || "主队", row.away || "客队", row.homeLogo, row.awayLogo)}</strong>
+            <small>ID ${escapeHtml(row.fixtureId || "-")} · ${escapeHtml(row.league || "-")} · ${escapeHtml(row.scoreLabel || "待赛果")}</small>
+          </span>
+          <span><b>原始</b>${formatSignedMoney(original.totalProfit || 0)}<small>${compactSelections(original.selections)}</small></span>
+          <span><b>当前</b>${formatSignedMoney(current.totalProfit || 0)}<small>${compactSelections(current.selections)}</small></span>
+        </button>
+      `;
+    })
+    .join("");
+  container.querySelectorAll("[data-run-id]").forEach((button) => {
+    button.addEventListener("click", () => previewPredictionRun(button.dataset.runId, { focusCabin: true }));
+  });
+}
+
+function compactSelections(selections = []) {
+  if (!selections.length) return "未入选";
+  return selections
+    .slice(0, 2)
+    .map((item) => `${item.market || "-"} ${item.selection || "-"}`)
+    .join(" / ");
+}
+
+async function loadPaperLedgerBook() {
+  try {
+    const response = await fetch("/api/paper-ledger");
+    const data = await response.json();
+    if (!response.ok) throw responseError(data, "读取模拟舱账本失败");
+    state.loaded.paperLedger = true;
+    renderPaperLedgerBook(data);
+  } catch (error) {
+    renderPaperLedgerBook({ error: toChineseError(error.message) });
+  }
+}
+
+function renderPaperLedgerBook(book = {}) {
+  const summary = book.summary || {};
+  const ledgerRows = book.ledger || [];
+  const liveRows = book.liveCabin || [];
+  const liveReservedStake = liveRows.reduce((total, row) => total + Number(row.stake || 0), 0);
+  const chartStatus = document.querySelector("#historyReplayStatus");
+  if (chartStatus) {
+    chartStatus.textContent = book.error
+      ? "账本读取失败"
+      : `起始 ${formatMoney(summary.startingBankroll ?? 1000)} · 当前 ${formatMoney(summary.equity ?? summary.startingBankroll ?? 1000)}`;
+  }
+  if (liveCabinStatus) {
+    liveCabinStatus.textContent = book.error
+      ? "读取失败"
+      : `持仓 ${summary.liveCabinCount ?? liveRows.length} 笔 · 占用 ${formatMoney(liveReservedStake)}`;
+  }
+  if (historyLedgerStatus) {
+    historyLedgerStatus.textContent = book.error
+      ? "读取失败"
+      : `下注 ${summary.ledgerCount ?? ledgerRows.length} 笔 · 已结算 ${summary.settledCount ?? 0} · 已折叠 ${summary.duplicatesExcluded ?? summary.duplicateCount ?? 0} 笔重复`;
+  }
+  renderPaperLedgerChart(book.timeline || [], book.error);
+  renderPaperLedgerSummary(summary, ledgerRows, book.error || summary.note);
+  renderLiveCabinRows(liveRows, book.error ? `读取失败：${book.error}` : "");
+  renderHistoryLedgerRows(ledgerRows, book.error || summary.note);
+}
+
+function renderPaperLedgerChart(timeline = [], error = "") {
+  if (error) {
+    renderLineChart("#historyBankrollChart", [], [], { baselineZero: false });
+    return;
+  }
+  const safeTimeline = timeline.length
+    ? timeline
+    : [{ date: "起始", label: "起始", bankroll: 1000 }];
+  const labels = safeTimeline.map((item) => String(item.date || item.label || "起始"));
+  const values = safeTimeline.map((item) => Number(item.bankroll || 0));
+  renderLineChart(
+    "#historyBankrollChart",
+    labels,
+    [{ values, color: "#2df0d0" }],
+    { baselineZero: false },
+  );
+}
+
+function renderPaperLedgerSummary(summary = {}, rows = [], note = "") {
+  const container = document.querySelector("#historyReplayLedger");
+  if (!container) return;
+  if (!rows.length) {
+    container.innerHTML = `<div class="panel-placeholder">${escapeHtml(note || "暂无下注记录")}</div>`;
+    return;
+  }
+  const chips = [
+    ["起始资金", formatMoney(summary.startingBankroll ?? 1000)],
+    ["当前资金", formatMoney(summary.equity ?? summary.startingBankroll ?? 1000)],
+    ["已实现盈亏", formatSignedMoney(summary.realizedPnl ?? 0)],
+  ];
+  container.innerHTML = `
+    <div class="ledger-summary-strip">
+      ${chips
+        .map(([label, value]) => `
+          <div>
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+          </div>
+        `)
+        .join("")}
+    </div>
+  `;
+}
+
+function renderPreMatchCabin(rows = [], note = "") {
+  if (!preMatchCabin) return;
+  if (!rows.length) {
+    preMatchCabin.innerHTML = `
+      <div class="panel-placeholder">
+        ${escapeHtml(note || "暂无未开赛记录")}
+      </div>
+    `;
+    return;
+  }
+  preMatchCabin.innerHTML = rows
+    .map((row) => {
+      const best = row.best || {};
+      return `
+        <article class="ledger-card pre-match-card">
+          <div class="ledger-card-head">
+            <strong>${teamPairHtml(row.home || "主队", row.away || "客队", row.homeLogo, row.awayLogo)}</strong>
+            <span class="history-signal ${historyActionClass(best.signalStatus || best.action)}">${escapeHtml(actionLabel(best.signalStatus || best.action || "RESEARCH_WATCH"))}</span>
+          </div>
+          <div class="ledger-card-meta">
+            <span>ID ${escapeHtml(row.fixtureId || "-")} · 运行 ${escapeHtml(row.runId || "-")}</span>
+            <span>${escapeHtml(row.league || "-")} · ${escapeHtml(row.kickoffBeijing || "-")}</span>
+            <span>盘口 ${escapeHtml(row.bookmaker || "未取得")} · ${escapeHtml(row.oddsCapturedAtBeijing || "未记录")}</span>
+          </div>
+          <div class="pre-market-strip">
+            ${(row.markets || []).map(renderPreMatchMarketChip).join("")}
+          </div>
+          <p class="ledger-note">${escapeHtml(best.reason || "研究观察，未入账。")}</p>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderPreMatchMarketChip(item = {}) {
+  const signal = item.signalStatus || item.action || "WATCH";
+  return `
+    <div class="pre-market-chip ${historyActionClass(signal)}">
+      <span>${escapeHtml(item.market || "-")}</span>
+      <strong>${escapeHtml(item.selection || "-")}</strong>
+      <small>赔率 ${item.odds == null ? "-" : formatNumber(item.odds, 2)} · 研究EV ${formatPercent(item.evPbaseResearch ?? item.expectedValue)}</small>
+    </div>
+  `;
+}
+
+function renderLiveCabinRows(rows = [], note = "") {
+  if (!liveCabin) return;
+  if (!rows.length) {
+    liveCabin.innerHTML = `
+      <div class="panel-placeholder">
+        ${escapeHtml(note || "暂无未开赛持仓")}
+      </div>
+    `;
+    return;
+  }
+  liveCabin.innerHTML = `
+    <div class="paper-ledger-table live-cabin-table">
+      <div class="paper-ledger-row paper-ledger-head">
+        <span>比赛 / 日期</span>
+        <span>方向</span>
+        <span>赔率 / 注额</span>
+        <span>模型 / 市场</span>
+        <span>状态 / 入账</span>
+        <span>资金</span>
+      </div>
+      ${rows
+        .map((row) => {
+          const paperEv = row.expectedValue ?? row.paperExpectedValue ?? row.evPbaseResearch;
+          const statusClass = historyActionClass(row.signalStatus || row.action || "PAPER_BUY");
+          return `
+            <button class="paper-ledger-row live-cabin-row" type="button" data-live-run="${escapeHtml(row.runId || "")}">
+              <span class="paper-ledger-match">
+                <strong>${teamPairHtml(row.home || "主队", row.away || "客队", row.homeLogo, row.awayLogo)}</strong>
+                <small>ID ${escapeHtml(row.fixtureId || "-")} · 运行 ${escapeHtml(row.runId || "-")}</small>
+                <small>${escapeHtml(row.league || "-")} · ${escapeHtml(row.kickoffBeijing || "开赛时间待核")}</small>
+              </span>
+              <span>
+                <b>${escapeHtml(row.market || "-")}</b>
+                <strong>${escapeHtml(row.selection || "-")}</strong>
+                <small>${escapeHtml(row.bookmaker || "盘口未记录")}</small>
+              </span>
+              <span>
+                <b>赔率</b>
+                <strong>${row.odds == null ? "-" : formatNumber(row.odds, 2)}</strong>
+                <small>注额 ${formatMoney(row.stake)}</small>
+              </span>
+              <span>
+                <b>模型 / 市场</b>
+                <strong>${formatPercent(row.modelProbability)} / ${formatPercent(row.marketProbability)}</strong>
+                <small>EV ${formatPercent(paperEv)}</small>
+              </span>
+              <span>
+                <span class="history-signal ${statusClass}">${escapeHtml(row.phaseLabel || row.statusLabel || "等待开赛")}</span>
+                <strong>待结算 · 未结算</strong>
+                <small>入账 ${escapeHtml(row.createdAtBeijing || "-")}</small>
+              </span>
+              <span>
+                <b>当前资金</b>
+                <strong>${formatMoney(row.currentEquity ?? row.bankrollBefore)}</strong>
+                <small>可用 ${formatMoney(row.cashAfterStake ?? row.bankrollAfterStake)} · 预留 ${formatMoney(row.reservedStakeAfter ?? row.stake)}</small>
+              </span>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+  liveCabin.querySelectorAll("[data-live-run]").forEach((button) => {
+    button.addEventListener("click", () => previewPredictionRun(button.dataset.liveRun, { focusCabin: true }));
+  });
+}
+
+function renderHistoryLedgerRows(rows = [], note = "") {
+  if (!historyLedger) return;
+  if (!rows.length) {
+    historyLedger.innerHTML = `
+      <div class="panel-placeholder">
+        ${escapeHtml(note || "暂无历史账本")}
+      </div>
+    `;
+    return;
+  }
+  historyLedger.innerHTML = `
+    <div class="paper-ledger-table">
+      <div class="paper-ledger-row paper-ledger-head">
+        <span>比赛 / 日期</span>
+        <span>方向</span>
+        <span>赔率 / 注额</span>
+        <span>模型 / 市场</span>
+        <span>赛果 / 盈亏</span>
+        <span>资金</span>
+      </div>
+      ${rows
+        .map((row) => {
+      const statusClass = row.status === "SETTLED" ? (Number(row.profit || 0) >= 0 ? "buy" : "suspended") : "watch";
+      return `
+        <button class="paper-ledger-row ${row.duplicateFlag ? "has-folded-duplicates" : ""}" type="button" data-ledger-run="${escapeHtml(row.runId || "")}">
+          <span class="paper-ledger-match">
+            <strong>${teamPairHtml(row.home || "主队", row.away || "客队", row.homeLogo, row.awayLogo)}</strong>
+            <small>ID ${escapeHtml(row.fixtureId || "-")} · 运行 ${escapeHtml(row.runId || "-")}</small>
+            <small>${escapeHtml(row.league || "-")} · ${escapeHtml(row.kickoffBeijing || "-")}</small>
+          </span>
+          <span>
+            <b>${escapeHtml(row.market || "-")}</b>
+            <strong>${escapeHtml(row.selection || "-")}</strong>
+            ${row.duplicateSuppressedCount ? `<small class="ledger-duplicate">已折叠重复 ${escapeHtml(row.duplicateSuppressedCount)} 笔</small>` : `<small>${escapeHtml(row.bookmaker || "未记录")}</small>`}
+          </span>
+          <span>
+            <b>赔率</b>
+            <strong>${row.odds == null ? "-" : formatNumber(row.odds, 2)}</strong>
+            <small>注额 ${formatMoney(row.stake)}</small>
+          </span>
+          <span>
+            <b>模型 / 市场</b>
+            <strong>${formatPercent(row.modelProbability)} / ${formatPercent(row.marketProbability)}</strong>
+            <small>研究EV ${formatPercent(row.evPbaseResearch ?? row.expectedValue)}</small>
+          </span>
+          <span>
+            <span class="history-signal ${statusClass}">${escapeHtml(row.statusLabel || "-")}</span>
+            <strong>${escapeHtml(row.score90 || "待结算")} · ${row.profit == null ? "未结算" : formatSignedMoney(row.profit)}</strong>
+            <small>${escapeHtml(row.settledAtBeijing || row.createdAtBeijing || "-")}</small>
+          </span>
+          <span>
+            <b>当前资金</b>
+            <strong>${row.bankrollAfterSettlement == null ? "待结算" : formatMoney(row.bankrollAfterSettlement)}</strong>
+            <small>${escapeHtml(row.status === "SETTLED" ? "已结算入曲线" : "未进入曲线")}</small>
+          </span>
+        </button>
+      `;
+    })
+    .join("")}
+    </div>
+  `;
+  historyLedger.querySelectorAll("[data-ledger-run]").forEach((button) => {
+    button.addEventListener("click", () => previewPredictionRun(button.dataset.ledgerRun, { focusCabin: true }));
+  });
 }
 
 async function loadRecentBatches() {
@@ -1605,7 +2102,7 @@ async function loadRecentBatches() {
 function renderRecentBatches() {
   if (!batchPoolContent) return;
   if (!state.recentBatches.length) {
-    batchPoolContent.innerHTML = `<div class="panel-placeholder">暂无批量批次。完成一次批量分析后，这里会保存批次并支持恢复。</div>`;
+    batchPoolContent.innerHTML = `<div class="panel-placeholder">暂无批次</div>`;
     if (batchPoolStatus) batchPoolStatus.textContent = "等待批量分析";
     return;
   }
@@ -1630,11 +2127,11 @@ function renderRecentBatches() {
         <span>匹配 / 共 ${escapeHtml(state.recentBatches.length)} 个批次</span>
       </div>
     </div>
-    <div class="fixture-empty">批次历史从本地数据库读取，恢复和编辑名称备注都不消耗 API 请求。</div>
+    <div class="fixture-empty">本地批次，不消耗 API。</div>
     ${
       pageItems.length
         ? `<div class="history-list batch-history-list">${pageItems.map(renderBatchHistoryItem).join("")}</div>`
-        : `<div class="panel-placeholder">没有匹配的批次。可以换一个关键词，或清空搜索。</div>`
+        : `<div class="panel-placeholder">无匹配批次</div>`
     }
     ${renderBatchHistoryPagination(filtered.length, totalPages)}
   `;
@@ -1660,19 +2157,7 @@ function renderBatchHistoryItem(batch) {
         <span><b>指定 ID</b>${escapeHtml(fixtureLabel)}${hiddenCount ? ` 等 ${hiddenCount} 场` : ""}</span>
         <span><b>备注</b>${escapeHtml(batch.notes || "未填写")}</span>
       </div>
-      <div class="batch-edit-grid">
-        <label>
-          <span>批次名称</span>
-          <input class="batch-title-input" value="${escapeHtml(batch.title || "")}" placeholder="例如：0603 今日甲级五场">
-        </label>
-        <label>
-          <span>备注</span>
-          <textarea class="batch-notes-input" rows="2" placeholder="记录筛选条件、异常盘口或复盘结论">${escapeHtml(batch.notes || "")}</textarea>
-        </label>
-      </div>
       <div class="history-actions">
-        <button class="mini-action save-batch-meta" type="button" data-batch-id="${escapeHtml(batch.id)}">保存名称备注</button>
-        <button class="mini-action mark-official-batch" type="button" data-batch-id="${escapeHtml(batch.id)}" data-date="${escapeHtml(batch.date || batch.officialDate || "")}">${batch.isOfficial ? "已是官方" : "设为官方批次"}</button>
         <button class="mini-action restore-batch" type="button" data-batch-id="${escapeHtml(batch.id)}">恢复批次</button>
       </div>
     </div>
@@ -1824,32 +2309,582 @@ async function loadBatchRun(batchId) {
   }
 }
 
-function renderHistory(runs) {
+function renderRunResultBlocks(payload, summary = {}) {
+  const blocks = buildRunResultBlocks(payload, summary);
+  return blocks.map((block) => `
+    <article class="run-result-card ${escapeHtml(block.statusClass || "neutral")}">
+      <span>${escapeHtml(block.label)}</span>
+      <strong>${escapeHtml(block.value)}</strong>
+      ${block.detail ? `<small>${escapeHtml(block.detail)}</small>` : ""}
+    </article>
+  `).join("");
+}
+
+function buildRunResultBlocks(payload, summary = {}) {
+  const oneXtwo = marketBlock(payload, summary, "胜平负");
+  const totals = marketBlock(payload, summary, "大小球");
+  const handicap = marketBlock(payload, summary, "让球");
+  const profit = singleRunProfit(payload, summary);
+  return [
+    oneXtwo,
+    totals,
+    handicap,
+    {
+      label: "资金",
+      value: formatSignedMoney(profit),
+      detail: "单场盈亏",
+      statusClass: Number(profit || 0) > 0 ? "positive" : Number(profit || 0) < 0 ? "negative" : "neutral",
+    },
+  ];
+}
+
+function marketBlock(payload, summary, market) {
+  const item = payload ? bestRecommendationForMarket(payload, market) : null;
+  if (item) {
+    const signal = item.signal_status || item.action || item.publicAction || "";
+    const evValue =
+      item.paper_expected_value_per_unit ??
+      item.ev_pshr_candidate ??
+      item.ev_pbase_research ??
+      item.expected_value_per_unit ??
+      item.conservative_expected_value_per_unit;
+    const detailParts = [
+      item.odds == null ? "" : `赔率 ${formatNumber(item.odds, 2)}`,
+      item.model_probability == null ? "" : `模型 ${formatPercent(item.model_probability)}`,
+      evValue == null ? "" : `EV ${formatPercent(evValue)}`,
+    ].filter(Boolean);
+    return {
+      label: market,
+      value: item.selection || "-",
+      detail: detailParts.join(" · "),
+      statusClass: historyActionClass(signal),
+    };
+  }
+
+  if (market === "胜平负") {
+    const label = summary.predictionLabel || summary.recommendationSelection || "-";
+    const detailParts = [
+      summary.odds == null ? "" : `赔率 ${formatNumber(summary.odds, 2)}`,
+      summary.modelProbability == null
+        ? summary.predictionProbability == null ? "" : `模型 ${formatPercent(summary.predictionProbability)}`
+        : `模型 ${formatPercent(summary.modelProbability)}`,
+      summary.evPbaseResearch == null && summary.expectedValue == null
+        ? ""
+        : `EV ${formatPercent(summary.evPbaseResearch ?? summary.expectedValue)}`,
+    ].filter(Boolean);
+    return {
+      label: market,
+      value: label,
+      detail: detailParts.join(" · ") || "等待回溯",
+      statusClass: historyActionClass(summary.signalStatus || summary.recommendationAction),
+    };
+  }
+
+  if (summary.recommendationMarket === market) {
+    const detailParts = [
+      summary.odds == null ? "" : `赔率 ${formatNumber(summary.odds, 2)}`,
+      summary.modelProbability == null ? "" : `模型 ${formatPercent(summary.modelProbability)}`,
+      summary.evPbaseResearch == null && summary.expectedValue == null
+        ? ""
+        : `EV ${formatPercent(summary.evPbaseResearch ?? summary.expectedValue)}`,
+    ].filter(Boolean);
+    return {
+      label: market,
+      value: summary.recommendationSelection || summary.recommendationSummary || "-",
+      detail: detailParts.join(" · "),
+      statusClass: historyActionClass(summary.signalStatus || summary.recommendationAction),
+    };
+  }
+
+  return {
+    label: market,
+    value: payload ? "暂无方向" : "回溯读取中",
+    detail: payload ? "未形成该市场方向" : "本地记录补齐",
+    statusClass: payload ? "neutral" : "loading",
+  };
+}
+
+function bestRecommendationForMarket(payload, market) {
+  const recommendations = (payload?.recommendations || []).filter((item) => item?.market === market);
+  if (!recommendations.length) return null;
+  const priority = {
+    PAPER_BUY: 5,
+    MODEL_CANDIDATE: 4,
+    BUY: 4,
+    SUSPENDED: 3,
+    RESEARCH_WATCH: 2,
+    WATCH: 2,
+    NO_MARKET: 1,
+  };
+  return [...recommendations].sort((a, b) => {
+    const aSignal = a.signal_status || a.action || "";
+    const bSignal = b.signal_status || b.action || "";
+    const aEv = Number(a.ev_pbase_research ?? a.expected_value_per_unit ?? -99);
+    const bEv = Number(b.ev_pbase_research ?? b.expected_value_per_unit ?? -99);
+    return (priority[bSignal] || 0) - (priority[aSignal] || 0) || bEv - aEv;
+  })[0];
+}
+
+function singleRunProfit(payload, summary = {}) {
+  if (payload?.portfolio?.expected_profit != null) return Number(payload.portfolio.expected_profit);
+  if (summary.expectedProfit != null) return Number(summary.expectedProfit);
+  if (summary.expectedBankroll != null && summary.bankroll != null) {
+    return Number(summary.expectedBankroll) - Number(summary.bankroll);
+  }
+  return 0;
+}
+
+async function hydrateRunCards(items = []) {
+  const runIds = [...new Set(items.map((item) => item.runId ?? item.id).filter(Boolean).map(String))];
+  await Promise.allSettled(runIds.slice(0, 20).map(async (runId) => {
+    const payload = await loadCachedPredictionPayload(runId);
+    document.querySelectorAll("[data-run-card]").forEach((card) => {
+      if (String(card.dataset.runCard) !== runId) return;
+      const target = card.querySelector(".run-result-grid");
+      if (target) target.innerHTML = renderRunResultBlocks(payload, items.find((item) => String(item.runId ?? item.id) === runId) || {});
+    });
+  }));
+}
+
+async function loadCachedPredictionPayload(runId) {
+  const key = String(runId);
+  if (state.historyDetailsCache.has(key)) return state.historyDetailsCache.get(key);
+  const response = await fetch(`/api/prediction?run_id=${encodeURIComponent(key)}`);
+  const data = await response.json();
+  if (!response.ok) throw responseError(data, "读取单场记录失败");
+  state.historyDetailsCache.set(key, data);
+  return data;
+}
+
+async function loadPredictionReplay(runId) {
+  const key = String(runId);
+  if (state.replayCache.has(key)) return state.replayCache.get(key);
+  const response = await fetch(`/api/prediction-replay?run_id=${encodeURIComponent(key)}`);
+  const data = await response.json();
+  if (!response.ok) throw responseError(data, "读取回溯模拟舱失败");
+  state.replayCache.set(key, data);
+  return data;
+}
+
+async function previewPredictionRun(runId, options = {}) {
+  if (!runId) return;
+  if (options.focusCabin) {
+    setActiveView("cabinView");
+    document.querySelector("#cabinView")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  try {
+    const replay = await loadPredictionReplay(runId);
+    renderHistoryReplayPreview(replay);
+    document.querySelectorAll("[data-run-card].selected").forEach((card) => card.classList.remove("selected"));
+    document.querySelector(`[data-run-card="${CSS.escape(String(runId))}"]`)?.classList.add("selected");
+  } catch (error) {
+    try {
+      const payload = await loadCachedPredictionPayload(runId);
+      renderHistoryTracePreview(payload, "批次回溯");
+    } catch {
+      if (historyTracePreview) {
+        historyTracePreview.innerHTML = `<div class="panel-placeholder">${escapeHtml(toChineseError(error.message))}</div>`;
+      }
+    }
+  }
+}
+
+function renderTraceDrawer(data) {
+  if (!traceDrawerContent) return;
+  const match = data.match || {};
+  const meta = data.meta || {};
+  const processing = data.dataProcessing || {};
+  const best = bestOverallRecommendation(data);
+  const home = processing.home || {};
+  const away = processing.away || {};
+  const snapshotRows = buildTraceSnapshotRows(data, best);
+  traceDrawerContent.innerHTML = `
+    <div class="trace-meta-card">
+      <span>比赛 ID</span>
+      <strong>${escapeHtml(meta.fixtureId || data.match_id || "-")}</strong>
+      <span>运行批次</span>
+      <strong>${data.runId ? `#${escapeHtml(data.runId)}` : "未生成"}</strong>
+      <span>分析时间</span>
+      <strong>${escapeHtml(meta.oddsCapturedAtBeijing || "当前本地记录")}</strong>
+    </div>
+    <div class="trace-timeline">
+      ${snapshotRows
+        .map(
+          (row) => `
+            <div class="trace-line">
+              <i></i>
+              <div>
+                <strong>${escapeHtml(row.label)}</strong>
+                <span>${escapeHtml(row.value)}</span>
+              </div>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+    ${renderTraceChecklist(best)}
+    <button class="secondary-action trace-review-link" type="button">查看完整赛后复盘 →</button>
+  `;
+  traceDrawerContent.querySelector(".trace-review-link")?.addEventListener("click", () => setActiveView("reviewView"));
+}
+
+function buildTraceSnapshotRows(data, best) {
+  const meta = data.meta || {};
+  const selected = meta.selectedBookmakers || {};
+  const lines = [
+    ["盘口快照", meta.oddsCapturedAtBeijing || "当前快照"],
+    ["胜平负", bookmakerLine("1X2", selected, bestRecommendationForMarket(data, "胜平负"))],
+    ["大小球", bookmakerLine("OU", selected, bestRecommendationForMarket(data, "大小球"))],
+    ["让球", bookmakerLine("AH", selected, bestRecommendationForMarket(data, "让球"))],
+  ];
+  if (best) {
+    lines.push(["模拟舱主方向", `${best.market || "-"} · ${best.selection || "-"} · ${actionLabel(best.signal_status || best.action || best.publicAction)}`]);
+  }
+  return lines.map(([label, value]) => ({ label, value }));
+}
+
+function bookmakerLine(key, selected, item) {
+  const bookmaker = selected[key] || "-";
+  const odds = item?.odds == null ? "" : ` @ ${formatNumber(item.odds, 2)}`;
+  const selection = item?.selection ? ` · ${item.selection}` : "";
+  return `${bookmaker}${selection}${odds}`;
+}
+
+function renderTraceChecklist(item) {
+  const rows = [
+    ["方向", item ? `${item.market || "-"}：${item.selection || "-"}` : "等待模拟舱方向", "ok"],
+    ["研究EV(pbase)", item?.ev_pbase_research ?? item?.expected_value_per_unit, "ok"],
+    ["纸上EV(p_adj)", item?.paper_expected_value_per_unit ?? item?.ev_pshr_candidate ?? item?.conservative_expected_value_per_unit, "warn"],
+    ["正式EV(pfinal)", item?.ev_pfinal_exec, "info"],
+    ["最终结果", "待赛后录入", "info"],
+  ];
+  return `
+    <div class="trace-check-card">
+      <h3>可回溯模拟舱结果</h3>
+      ${rows
+        .map(([label, value, tone]) => `
+          <div class="trace-check ${tone}">
+            <span>${escapeHtml(label)}</span>
+            <strong>${typeof value === "number" ? formatPercent(value) : escapeHtml(value == null ? "未开放" : value)}</strong>
+          </div>
+        `)
+        .join("")}
+    </div>
+  `;
+}
+
+function renderHistoryReplayPreview(replay) {
+  if (!historyTracePreview) return;
+  const match = replay.match || {};
+  const meta = replay.meta || {};
+  const result = replay.result || {};
+  const original = replay.modes?.original || {};
+  const current = replay.modes?.current || {};
+  const originalRows = original.rows || [];
+  const currentRows = current.rows || [];
+  const replayRows = originalRows.length ? originalRows : currentRows;
+  if (historyPreviewCrumbs) {
+    historyPreviewCrumbs.textContent = `回溯 → 当时方向`;
+  }
+  historyTracePreview.innerHTML = `
+    <div class="replay-lab compact-replay">
+      <section class="replay-hero">
+        <div>
+          <span>历史回放</span>
+          <strong>${teamPairHtml(match.homeZh || match.home || "主队", match.awayZh || match.away || "客队", match.homeLogo, match.awayLogo)}</strong>
+          <small>${escapeHtml(meta.leagueNameZh || meta.leagueName || "-")} · ${escapeHtml(meta.kickoffBeijing || "-")} · 运行 #${escapeHtml(replay.runId || "-")}</small>
+        </div>
+        <div class="replay-result ${result.status === "SETTLED" ? "settled" : "pending"}">
+          <span>${escapeHtml(result.statusLabel || "未结算")}</span>
+          <strong>${escapeHtml(result.scoreLabel || "待赛果")}</strong>
+          <small>${escapeHtml(result.actualResultLabel || "")}</small>
+        </div>
+      </section>
+
+      <section class="replay-table-card">
+        <div class="section-header compact">
+          <div><p class="eyebrow">原始快照</p><h3>当时模拟舱方向</h3></div>
+          <span class="muted">不重抓盘口</span>
+        </div>
+        ${renderReplayRows(replayRows)}
+      </section>
+    </div>
+  `;
+}
+
+function renderReplayModeCard(mode) {
+  const summary = mode.summary || {};
+  return `
+    <article class="replay-mode-card">
+      <div class="replay-mode-head">
+        <div>
+          <span>${escapeHtml(mode.modeLabel || "-")}</span>
+          <strong>${formatSignedMoney(summary.totalProfit || 0)}</strong>
+        </div>
+        <em>${escapeHtml(mode.modeNote || "")}</em>
+      </div>
+      <div class="replay-metrics">
+        <div><span>入选</span><strong>${escapeHtml(summary.selectedCount ?? 0)}</strong></div>
+        <div><span>已结算</span><strong>${escapeHtml(summary.settledCount ?? 0)}</strong></div>
+        <div><span>占用</span><strong>${formatMoney(summary.totalStake || 0)}</strong></div>
+        <div><span>ROI</span><strong>${formatPercent(summary.roi || 0)}</strong></div>
+      </div>
+      <div class="replay-market-strip">
+        ${(mode.marketSummary || []).map((item) => `
+          <span>
+            ${escapeHtml(item.market || "-")}
+            <b>${escapeHtml(item.selectedCount ?? 0)}</b>
+            <small>${formatSignedMoney(item.totalProfit || 0)}</small>
+          </span>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderReplayRows(rows = []) {
+  if (!rows.length) return `<div class="panel-placeholder">暂无可回溯方向。</div>`;
+  return `
+    <div class="replay-rows">
+      ${rows.map((row) => {
+        const tone = row.selected
+          ? row.profit > 0 ? "positive" : row.profit < 0 ? "negative" : "neutral"
+          : "muted";
+        return `
+          <div class="replay-row ${tone}">
+            <div>
+              <span>${escapeHtml(row.market || "-")}</span>
+              <strong>${escapeHtml(row.selection || "-")}</strong>
+              <small>${escapeHtml(row.eligibilityLabel || "-")}</small>
+            </div>
+            <div><span>赔率</span><strong>${row.odds == null ? "-" : formatNumber(row.odds, 2)}</strong></div>
+            <div><span>${escapeHtml(row.modelProbabilityLabel || "模型概率")}</span><strong>${formatPercent(row.modelProbability)}</strong></div>
+            <div><span>研究EV</span><strong>${formatPercent(row.researchEv)}</strong></div>
+            <div><span>纸上EV</span><strong>${row.paperEv == null ? "未开放" : formatPercent(row.paperEv)}</strong></div>
+            <div><span>赛果</span><strong>${escapeHtml(row.settlementLabel || "-")}</strong></div>
+            <div><span>盈亏</span><strong>${formatSignedMoney(row.profit || 0)}</strong></div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderReplayChart(selector, timeline, color) {
+  const labels = (timeline || []).map((item) => String(item.label || "-"));
+  const values = (timeline || []).map((item) => Number(item.bankroll || 0));
+  renderLineChart(selector, labels, [{ values, color }], { baselineZero: false });
+}
+
+function renderHistoryTracePreview(data, sourceLabel = "批次回溯") {
+  if (!historyTracePreview) return;
+  const match = data.match || {};
+  const meta = data.meta || {};
+  const processing = data.dataProcessing || {};
+  const best = bestOverallRecommendation(data);
+  const home = processing.home || {};
+  const away = processing.away || {};
+  const profit = singleRunProfit(data, {});
+  if (historyPreviewCrumbs) {
+    historyPreviewCrumbs.textContent = `${sourceLabel} → 查看单场 → 数据回溯 → 模拟舱结果`;
+  }
+  historyTracePreview.innerHTML = `
+    <div class="trace-preview-grid">
+      <article class="trace-preview-card match-card">
+        <strong>${teamPairHtml(teamLabel(match, "home"), teamLabel(match, "away"), teamLogoFromMatch(match, "home"), teamLogoFromMatch(match, "away"))}</strong>
+        <span>ID: ${escapeHtml(meta.fixtureId || "-")} · ${escapeHtml(meta.leagueNameZh || meta.leagueName || "-")}</span>
+        <span>${escapeHtml(meta.kickoffBeijing || "-")} · ${escapeHtml(meta.venue || "-")}</span>
+      </article>
+      <article class="trace-preview-card">
+        <span>盘口快照</span>
+        <strong>${escapeHtml(meta.oddsCapturedAtBeijing || "当前快照")}</strong>
+        <small>${escapeHtml((meta.bookmakerPriority || []).slice(0, 4).join(" / ") || meta.bookmaker || "未记录庄家")}</small>
+      </article>
+      <article class="trace-preview-card">
+        <span>近 10 场样本</span>
+        <strong>${escapeHtml(home.validCount ?? 0)}/10 · ${escapeHtml(away.validCount ?? 0)}/10</strong>
+        <small>主队场均进球 ${formatNumber(home.goalsForAverage, 2)}，客队场均进球 ${formatNumber(away.goalsForAverage, 2)}</small>
+      </article>
+      <article class="trace-preview-card">
+        <span>模拟舱原因</span>
+        <strong>${escapeHtml(best ? actionLabel(best.signal_status || best.action || best.publicAction) : "等待方向")}</strong>
+        <small>${escapeHtml(best?.reason || "等待模型生成可解释原因。")}</small>
+      </article>
+      <article class="trace-preview-card ev-card">
+        <span>EV 闸门</span>
+        <strong>${escapeHtml(best ? decisionLabel(best.decision_status || best.ev_status || best.signal_status) : "未开放")}</strong>
+        <small>研究EV ${best?.ev_pbase_research == null ? "-" : formatPercent(best.ev_pbase_research)} · 纸上EV ${best?.paper_expected_value_per_unit == null ? "-" : formatPercent(best.paper_expected_value_per_unit)}</small>
+      </article>
+    </div>
+    <div class="trace-preview-bottom">
+      <div class="trace-time-axis">
+        ${["盘口初盘", "早盘资金流", "临场波动", "比赛前10分钟", "开赛", "半场", "全场结束"]
+          .map((label, index) => `<span class="${index === 3 ? "active" : ""}"><i></i>${escapeHtml(label)}</span>`)
+          .join("")}
+      </div>
+      <div class="trace-profit-chart">
+        <div>
+          <span>模拟舱盈亏曲线</span>
+          <strong>最终盈亏 ${formatSignedMoney(profit)}</strong>
+        </div>
+        ${miniProfitSvg(profit)}
+      </div>
+    </div>
+  `;
+}
+
+function bestOverallRecommendation(payload) {
+  const items = payload?.recommendations || [];
+  if (!items.length) return null;
+  const priority = {
+    PAPER_BUY: 6,
+    MODEL_CANDIDATE: 5,
+    BUY: 5,
+    RESEARCH_WATCH: 4,
+    WATCH: 3,
+    SUSPENDED: 2,
+    NO_MARKET: 1,
+  };
+  return [...items].sort((a, b) => {
+    const aSignal = a.signal_status || a.action || a.publicAction || "";
+    const bSignal = b.signal_status || b.action || b.publicAction || "";
+    const aEv = Number(a.ev_pbase_research ?? a.expected_value_per_unit ?? -99);
+    const bEv = Number(b.ev_pbase_research ?? b.expected_value_per_unit ?? -99);
+    return (priority[bSignal] || 0) - (priority[aSignal] || 0) || bEv - aEv;
+  })[0];
+}
+
+function miniProfitSvg(profit) {
+  const raw = Number(profit || 0);
+  const end = Number.isFinite(raw) ? raw : 0;
+  const values = [0, end * 0.16, end * 0.32, end * 0.58, end * 0.72, end * 0.86, end];
+  const min = Math.min(...values, -20);
+  const max = Math.max(...values, 20);
+  const points = values
+    .map((value, index) => {
+      const x = 18 + index * 52;
+      const y = 80 - ((value - min) / (max - min || 1)) * 54;
+      return `${x},${y}`;
+    })
+    .join(" ");
+  return `
+    <svg viewBox="0 0 350 100" role="img" aria-label="模拟舱盈亏曲线">
+      <defs>
+        <linearGradient id="profitLine" x1="0" x2="1">
+          <stop offset="0" stop-color="#2df0d0" />
+          <stop offset="1" stop-color="#4fa7ff" />
+        </linearGradient>
+      </defs>
+      <path d="M18 80H332" stroke="rgba(159,200,214,.2)" stroke-width="1" />
+      <polyline points="${points}" fill="none" stroke="url(#profitLine)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+      <circle cx="330" cy="${points.split(" ").at(-1).split(",")[1]}" r="4" fill="${end >= 0 ? "#2df0d0" : "#ff6f71"}" />
+    </svg>
+  `;
+}
+
+function renderHistoryRailFacade(runs) {
+  if (!historyRailContent) return;
+  const latest = runs[0] || {};
+  const signalCount = runs.filter((run) => ["PAPER_BUY", "MODEL_CANDIDATE", "BUY", "RESEARCH_WATCH"].includes(run.signalStatus || run.recommendationAction)).length;
+  const watchCount = runs.filter((run) => ["RESEARCH_WATCH", "WATCH"].includes(run.signalStatus || run.recommendationAction)).length;
+  const suspendedCount = runs.filter((run) => (run.signalStatus || run.recommendationAction) === "SUSPENDED").length;
+  const bookmakers = uniqueSorted(runs.map((run) => run.bookmaker).filter(Boolean)).slice(0, 5);
   if (!runs.length) {
-    document.querySelector("#historyList").innerHTML = `<div class="panel-placeholder">暂无预测记录</div>`;
+    historyRailContent.innerHTML = `<div class="panel-placeholder">暂无历史预测记录。</div>`;
     return;
   }
-  document.querySelector("#historyList").innerHTML = runs
-    .map((run) => `
-      <div class="history-item">
-        <div class="history-main">
-          <strong>${escapeHtml(`${run.homeZh || "主队"} vs ${run.awayZh || "客队"}`)}</strong>
-          <span class="muted">运行 ${escapeHtml(run.id)} · ${escapeHtml(run.leagueZh || "-")} · ${escapeHtml(run.kickoffBeijing || run.created_at || "-")}</span>
-        </div>
-        <div class="history-insights">
-          <span><b>预测</b>${escapeHtml(run.predictionLabel || "-")} ${formatPercent(run.predictionProbability)}</span>
-          <span><b>模拟舱</b>${escapeHtml(run.recommendationSummary || "-")}</span>
-          <span><b>资金</b>${formatMoney(run.bankroll)} → ${formatMoney(run.expectedBankroll)}</span>
-          <span><b>质量</b>${escapeHtml(run.qualityLabel || "-")} · 庄家 ${escapeHtml(run.bookmaker || "未取得")}</span>
-        </div>
-        <div class="history-actions">
-          <span class="history-signal ${historyActionClass(run.signalStatus || run.recommendationAction)}">${escapeHtml(actionLabel(run.signalStatus || run.recommendationAction))}</span>
-          <a class="history-link" href="/api/report?format=xlsx&amp;run_id=${encodeURIComponent(run.id)}">Excel</a>
-          <a class="history-link" href="/api/report?format=pdf&amp;run_id=${encodeURIComponent(run.id)}">PDF</a>
-        </div>
-      </div>
-    `)
-    .join("");
+  historyRailContent.innerHTML = `
+    <div class="history-rail-meta">
+      <span>当前批次</span>
+      <strong>运行 #${escapeHtml(latest.id || "-")}</strong>
+      <span>最近时间</span>
+      <strong>${escapeHtml(latest.kickoffBeijing || latest.created_at || "-")}</strong>
+    </div>
+    <div class="history-rail-stats">
+      <span><b>${escapeHtml(runs.length)}</b> 总记录</span>
+      <span><b>${escapeHtml(signalCount)}</b> 可观察</span>
+      <span><b>${escapeHtml(watchCount)}</b> 观望</span>
+      <span><b>${escapeHtml(suspendedCount)}</b> 暂停</span>
+    </div>
+    <div class="control-divider"><p class="eyebrow">博彩公司优先级</p></div>
+    <div class="bookmaker-priority">
+      ${(bookmakers.length ? bookmakers : ["Pinnacle", "Bet365", "Sbobt"])
+        .map((bookmaker, index) => `<span class="${index === 0 ? "active" : ""}">${escapeHtml(bookmaker)}</span>`)
+        .join("")}
+    </div>
+    <div class="control-divider"><p class="eyebrow">批次操作</p></div>
+    <button class="secondary-action history-rail-action" type="button" data-history-action="batch">查看批量赛事池</button>
+    <button class="secondary-action history-rail-action" type="button" data-history-action="review">查看赛后复盘</button>
+  `;
+  historyRailContent.querySelector('[data-history-action="batch"]')?.addEventListener("click", () => setActiveView("batchView"));
+  historyRailContent.querySelector('[data-history-action="review"]')?.addEventListener("click", () => setActiveView("reviewView"));
+}
+
+function renderHistory(runs) {
+  state.historyRuns = runs || [];
+  if (!runs.length) {
+    document.querySelector("#historyList").innerHTML = `<div class="panel-placeholder">暂无预测记录</div>`;
+    renderHistoryRailFacade([]);
+    return;
+  }
+  renderHistoryRailFacade(runs);
+  const totalPages = Math.max(1, Math.ceil(runs.length / state.historyPageSize));
+  state.historyPage = clamp(Number(state.historyPage || 1), 1, totalPages);
+  const start = (state.historyPage - 1) * state.historyPageSize;
+  const pageRuns = runs.slice(start, start + state.historyPageSize);
+  document.querySelector("#historyList").innerHTML = `
+    <div class="history-card-list">
+      ${pageRuns
+        .map((run) => `
+          <article class="history-card-row" data-run-card="${escapeHtml(run.id)}">
+            <div class="history-card-main">
+              <strong>${teamPairHtml(run.homeZh || run.home_team || "主队", run.awayZh || run.away_team || "客队", run.homeLogo || run.home_logo, run.awayLogo || run.away_logo)}</strong>
+              <span class="muted">ID: ${escapeHtml(run.match_id || run.fixtureId || "-")} · 运行 ${escapeHtml(run.id)}</span>
+            </div>
+            <div class="history-card-meta">
+              <span>联赛 / 时间</span>
+              <strong>${escapeHtml(run.leagueZh || "-")}</strong>
+              <span>${escapeHtml(run.kickoffBeijing || run.created_at || "-")}</span>
+              <small>${escapeHtml(run.bookmaker || "优先庄家")}</small>
+            </div>
+            <div class="run-result-grid history-card-markets">${renderRunResultBlocks(null, run)}</div>
+            <div class="history-card-actions">
+              <button class="mini-action open-run" type="button" data-run-id="${escapeHtml(run.id)}">查看单场</button>
+              <button class="mini-action open-trace" type="button" data-run-id="${escapeHtml(run.id)}">回溯数据</button>
+              <a class="history-link" href="/api/report?format=xlsx&amp;run_id=${encodeURIComponent(run.id)}">导出报告</a>
+            </div>
+          </article>
+        `)
+        .join("")}
+    </div>
+    ${renderHistoryPagination(runs.length, totalPages)}
+  `;
+  const historyList = document.querySelector("#historyList");
+  historyList.querySelectorAll(".open-run").forEach((button) => {
+    button.addEventListener("click", () => loadPredictionRun(button.dataset.runId));
+  });
+  historyList.querySelectorAll(".open-trace").forEach((button) => {
+    button.addEventListener("click", () => previewPredictionRun(button.dataset.runId, { focusCabin: true }));
+  });
+  historyList.querySelectorAll(".history-page").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.historyPage = clamp(Number(button.dataset.page || 1), 1, totalPages);
+      renderHistory(state.historyRuns);
+    });
+  });
+  hydrateRunCards(pageRuns);
+  previewPredictionRun(pageRuns[0]?.id);
+}
+
+function renderHistoryPagination(total, totalPages) {
+  if (total <= state.historyPageSize) return "";
+  return `
+    <div class="batch-pagination history-pagination">
+      <button class="mini-action history-page" type="button" data-page="${state.historyPage - 1}"${state.historyPage <= 1 ? " disabled" : ""}>上一页</button>
+      <span>第 ${escapeHtml(state.historyPage)} / ${escapeHtml(totalPages)} 页 · 共 ${escapeHtml(total)} 条</span>
+      <button class="mini-action history-page" type="button" data-page="${state.historyPage + 1}"${state.historyPage >= totalPages ? " disabled" : ""}>下一页</button>
+    </div>
+  `;
 }
 
 function renderBankrollTrend(runs) {
@@ -1864,7 +2899,6 @@ function renderBankrollTrend(runs) {
     { values: expected, color: "#7ca8ee" },
   ];
   renderLineChart("#portfolioTrendChart", labels, series, { baselineZero: false });
-  renderLineChart("#historyBankrollChart", labels, series, { baselineZero: false });
 }
 
 function renderModelValidation(validation) {
@@ -1888,17 +2922,49 @@ function renderModelValidation(validation) {
       `,
     )
     .join("");
+  renderMarketValidation(validation.marketValidation || {});
   const checks = (validation.checks || [])
     .filter((item) => !item.passed)
     .slice(0, 4)
     .map((item) => `${item.label}不足：${item.detail}`);
   const notes = [
-    `合格已结算样本 ${validation.eligibleSamples ?? 0}，独立比赛 ${validation.distinctFixtures ?? 0}。`,
+    `样本 ${validation.eligibleSamples ?? 0} · 独立 ${validation.distinctFixtures ?? 0}`,
     ...checks,
-    ...(validation.notes || []).slice(0, 3),
+    ...(validation.notes || []).slice(0, 2),
   ];
   document.querySelector("#validationNotes").innerHTML =
     notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+}
+
+function renderMarketValidation(markets) {
+  const container = document.querySelector("#marketValidationGrid");
+  if (!container) return;
+  const ordered = ["1X2", "OU", "AH"]
+    .map((key) => markets[key])
+    .filter(Boolean);
+  if (!ordered.length) {
+    container.innerHTML = "";
+    return;
+  }
+  container.innerHTML = ordered
+    .map((item) => {
+      const failed = (item.failedChecks || []).filter((check) => check && !check.passed);
+      const ready = item.status === "ELIGIBLE_FOR_REVIEW" || item.status === "PAPER_READY";
+      const split = item.split || {};
+      const detail = failed[0]
+        ? `${failed[0].label || "未通过"}：${failed[0].detail || "-"}`
+        : item.note || "门槛正常";
+      return `
+        <div class="market-validation-card ${ready ? "ready" : "blocked"}">
+          <strong>${escapeHtml(item.marketLabel || item.market || "-")}</strong>
+          <b>${escapeHtml(item.statusLabel || "-")}</b>
+          <span>样本 ${escapeHtml(item.samples ?? 0)} · 独立比赛 ${escapeHtml(item.distinctFixtures ?? 0)}</span>
+          <span>校准 ${escapeHtml(split.calibration ?? "-")} · 验证 ${escapeHtml(split.validation ?? "-")}</span>
+          <small>${escapeHtml(detail)}</small>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function renderLiveReadiness(readiness) {
@@ -1923,7 +2989,7 @@ function renderLiveReadiness(readiness) {
           `,
         )
         .join("")
-    : `<div class="panel-placeholder">暂无实盘准入数据。</div>`;
+    : `<div class="panel-placeholder">暂无准入数据</div>`;
 }
 
 function numberValue(selector, fallback) {
@@ -1977,6 +3043,13 @@ function formatMoney(value) {
   return `¥${Number(value).toFixed(2)}`;
 }
 
+function formatSignedMoney(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "-";
+  const number = Number(value);
+  if (Math.abs(number) < 0.005) return "¥0.00";
+  return `${number > 0 ? "+" : "-"}¥${Math.abs(number).toFixed(2)}`;
+}
+
 function formatLine(value) {
   if (value == null || !Number.isFinite(Number(value))) return "-";
   return Number(value).toFixed(2).replace(/\.00$/, "").replace(/0$/, "");
@@ -2008,16 +3081,179 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function renderMatchTitle(match) {
+  return `
+    <span class="match-team">${teamLabelHtml(match, "home")}</span>
+    <span class="vs-token">VS</span>
+    <span class="match-team">${teamLabelHtml(match, "away")}</span>
+  `;
+}
+
 function teamLabel(match, side) {
   const zhKey = `${side}Zh`;
   return match?.[zhKey] || match?.[side] || "-";
+}
+
+function teamLabelWithFlag(match, side) {
+  return teamLabel(match, side);
+}
+
+function teamLabelHtml(match, side) {
+  return teamNameHtml(teamLabel(match, side), teamLogoFromMatch(match, side));
+}
+
+function teamPairHtml(home, away, homeLogo = "", awayLogo = "") {
+  return `
+    <span class="team-pair">
+      ${teamNameHtml(home, homeLogo)}
+      <span class="pair-vs">vs</span>
+      ${teamNameHtml(away, awayLogo)}
+    </span>
+  `;
+}
+
+function teamNameHtml(name, logoUrl = "") {
+  const label = String(name || "-");
+  return `
+    <span class="team-name">
+      ${teamVisualHtml(label, logoUrl)}
+      <span>${escapeHtml(label)}</span>
+    </span>
+  `;
+}
+
+function teamVisualHtml(name, logoUrl = "") {
+  const label = String(name || "").trim();
+  const fallback = teamInitial(label);
+  const countryCode = countryCodeForTeam(label);
+  if (countryCode) {
+    return `
+      <span class="team-visual team-flag" data-fallback="${escapeHtml(fallback)}">
+        <img src="${escapeHtml(flagImageUrl(countryCode))}" alt="${escapeHtml(label)} 国旗" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.team-visual').classList.add('is-missing')" />
+      </span>
+    `;
+  }
+  const safeLogoUrl = sanitizeTeamImageUrl(logoUrl);
+  if (safeLogoUrl) {
+    return `
+      <span class="team-visual team-logo" data-fallback="${escapeHtml(fallback)}">
+        <img src="${escapeHtml(safeLogoUrl)}" alt="${escapeHtml(label)} 标识" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.team-visual').classList.add('is-missing')" />
+      </span>
+    `;
+  }
+  return `<span class="team-visual team-placeholder" aria-hidden="true">${escapeHtml(fallback)}</span>`;
+}
+
+function teamLogoFromMatch(match, side) {
+  const camelKey = `${side}Logo`;
+  const snakeKey = `${side}_logo`;
+  const urlKey = `${side}LogoUrl`;
+  return match?.[camelKey] || match?.[snakeKey] || match?.[urlKey] || "";
+}
+
+function sanitizeTeamImageUrl(value) {
+  const url = String(value || "").trim();
+  if (!url) return "";
+  if (/^https?:\/\//i.test(url) || url.startsWith("/assets/") || url.startsWith("assets/")) return url;
+  return "";
+}
+
+function flagImageUrl(countryCode) {
+  return `https://flagcdn.com/${String(countryCode).toLowerCase()}.svg`;
+}
+
+function teamInitial(name) {
+  const text = String(name || "").trim();
+  if (!text || text === "-") return "?";
+  const chars = Array.from(text.replace(/\s+/g, ""));
+  return (chars[0] || "?").toUpperCase();
+}
+
+function flagForTeam(name) {
+  return countryCodeForTeam(name);
+}
+
+function countryCodeForTeam(name) {
+  const original = String(name || "").trim();
+  if (!original || original === "-") return "";
+  const normalizedOriginal = original
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const normalized = original
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+(U\d+|Women|女足)$/i, "")
+    .replace(/（.*?）/g, "")
+    .trim()
+    .toLowerCase();
+  const aliases = {
+    "mexico": "mx", "墨西哥": "mx",
+    "south africa": "za", "南非": "za",
+    "south korea": "kr", "korea republic": "kr", "韩国": "kr",
+    "czech republic": "cz", "czechia": "cz", "捷克": "cz",
+    "bolivia": "bo", "玻利维亚": "bo",
+    "algeria": "dz", "阿尔及利亚": "dz",
+    "england": "gb-eng", "英格兰": "gb-eng",
+    "scotland": "gb-sct", "苏格兰": "gb-sct",
+    "wales": "gb-wls", "威尔士": "gb-wls",
+    "northern ireland": "gb-nir", "北爱尔兰": "gb-nir",
+    "costa rica": "cr", "哥斯达黎加": "cr",
+    "portugal": "pt", "葡萄牙": "pt",
+    "nigeria": "ng", "尼日利亚": "ng",
+    "iraq": "iq", "伊拉克": "iq",
+    "venezuela": "ve", "委内瑞拉": "ve",
+    "saudi arabia": "sa", "沙特阿拉伯": "sa",
+    "senegal": "sn", "塞内加尔": "sn",
+    "togo": "tg", "多哥": "tg",
+    "benin": "bj", "贝宁": "bj",
+    "azerbaijan": "az", "阿塞拜疆": "az",
+    "san marino": "sm", "圣马力诺": "sm",
+    "angola": "ao", "安哥拉": "ao",
+    "central african republic": "cf", "中非共和国": "cf",
+    "russia": "ru", "俄罗斯": "ru",
+    "trinidad and tobago": "tt", "特立尼达和多巴哥": "tt",
+    "austria": "at", "奥地利": "at",
+    "netherlands": "nl", "holland": "nl", "荷兰": "nl",
+    "guatemala": "gt", "危地马拉": "gt",
+    "usa": "us", "united states": "us", "美国": "us",
+    "canada": "ca", "加拿大": "ca",
+    "luxembourg": "lu", "卢森堡": "lu",
+    "kosovo": "xk", "科索沃": "xk",
+    "saudi arabia": "sa", "沙特": "sa",
+    "qatar": "qa", "卡塔尔": "qa",
+    "japan": "jp", "日本": "jp",
+    "china": "cn", "中国": "cn",
+    "france": "fr", "法国": "fr",
+    "germany": "de", "德国": "de",
+    "italy": "it", "意大利": "it",
+    "spain": "es", "西班牙": "es",
+    "turkey": "tr", "turkiye": "tr", "土耳其": "tr",
+    "switzerland": "ch", "瑞士": "ch",
+    "curacao": "cw", "库拉索": "cw",
+    "brazil": "br", "巴西": "br",
+    "argentina": "ar", "阿根廷": "ar",
+    "uruguay": "uy", "乌拉圭": "uy",
+    "chile": "cl", "智利": "cl",
+    "colombia": "co", "哥伦比亚": "co",
+    "paraguay": "py", "巴拉圭": "py",
+    "ecuador": "ec", "厄瓜多尔": "ec",
+    "peru": "pe", "秘鲁": "pe",
+    "morocco": "ma", "摩洛哥": "ma",
+    "egypt": "eg", "埃及": "eg",
+    "ghana": "gh", "加纳": "gh",
+    "cameroon": "cm", "喀麦隆": "cm",
+    "cote d'ivoire": "ci", "ivory coast": "ci", "科特迪瓦": "ci",
+    "australia": "au", "澳大利亚": "au",
+    "new zealand": "nz", "新西兰": "nz",
+  };
+  return aliases[normalized] || aliases[normalizedOriginal] || aliases[original] || "";
 }
 
 function actionLabel(action) {
   return {
     BUY: "模型候选",
     MODEL_CANDIDATE: "模型候选",
-    PAPER_BUY: "纸上观察",
+    PAPER_BUY: "纸上模拟",
     WATCH: "研究观察",
     RESEARCH_WATCH: "研究观察",
     SUSPENDED: "模拟暂停",
@@ -2029,7 +3265,7 @@ function decisionLabel(status) {
   return {
     NO_VALUE: "无价值",
     RESEARCH_OBSERVATION: "研究观察",
-    PAPER_OBSERVATION: "纸上观察",
+    PAPER_OBSERVATION: "纸上模拟",
     HIGH_RISK_OBSERVATION: "高风险观察",
     MODEL_MARKET_CONFLICT: "模型市场冲突",
     SUSPENDED: "暂停",
@@ -2064,7 +3300,7 @@ function responseError(data, fallback) {
 
 function toChineseError(message) {
   if (message.includes("No upcoming head-to-head fixture")) {
-    return "API-Football 未找到两队已排定的未来直接交锋。请点击“搜索比赛”选择赛程，或填写已知比赛 ID。";
+    return "未找到未来交锋。请搜索赛程或填写比赛 ID。";
   }
   if (message.includes("No API-Football team found")) {
     return "API-Football 未找到该球队，请检查球队英文名。";

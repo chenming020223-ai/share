@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 HOST="${WORLDCUP_WEB_HOST:-127.0.0.1}"
-PORT="${WORLDCUP_WEB_PORT:-8766}"
+PORT="${WORLDCUP_WEB_PORT:-8765}"
 URL="http://${HOST}:${PORT}"
 LOG_DIR="storage"
 PID_FILE="${LOG_DIR}/web_server.pid"

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .settings import default_db_path
+
+_INIT_LOCK = threading.Lock()
+_INITIALIZED_DATABASES: set[str] = set()
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -21,9 +25,15 @@ class ClosingConnection(sqlite3.Connection):
 def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, factory=ClosingConnection)
+    conn = sqlite3.connect(path, timeout=30.0, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
-    init_db(conn)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    db_key = str(path.resolve())
+    if db_key not in _INITIALIZED_DATABASES:
+        with _INIT_LOCK:
+            if db_key not in _INITIALIZED_DATABASES:
+                init_db(conn)
+                _INITIALIZED_DATABASES.add(db_key)
     return conn
 
 
@@ -94,6 +104,29 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(snapshot_id) REFERENCES api_snapshots(id)
         );
 
+        CREATE TABLE IF NOT EXISTS odds_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            fixture_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            bookmaker TEXT NOT NULL,
+            captured_at TEXT NOT NULL DEFAULT '',
+            kickoff_at TEXT NOT NULL DEFAULT '',
+            model_version TEXT NOT NULL DEFAULT '',
+            market_type TEXT NOT NULL,
+            line REAL,
+            line_key TEXT NOT NULL,
+            selection TEXT NOT NULL,
+            decimal_odds REAL NOT NULL,
+            market_probability REAL NOT NULL,
+            market_key TEXT NOT NULL,
+            selection_key TEXT NOT NULL,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            is_pre_match INTEGER NOT NULL DEFAULT 0,
+            is_closing_candidate INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(fixture_id, bookmaker, captured_at, selection_key)
+        );
+
         CREATE TABLE IF NOT EXISTS paper_bankroll_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -156,6 +189,12 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_market_quotes_fixture_time
             ON market_quotes(fixture_id, captured_at);
+
+        CREATE INDEX IF NOT EXISTS idx_odds_snapshots_fixture_time
+            ON odds_snapshots(fixture_id, captured_at);
+
+        CREATE INDEX IF NOT EXISTS idx_odds_snapshots_closing
+            ON odds_snapshots(fixture_id, is_closing_candidate);
 
         CREATE INDEX IF NOT EXISTS idx_paper_bankroll_ledger_run
             ON paper_bankroll_ledger(run_id);
@@ -564,6 +603,134 @@ def market_quotes_for_snapshot(snapshot_id: int, db_path: str | Path | None = No
     return [dict(row) for row in rows]
 
 
+def record_odds_movement_snapshot(
+    *,
+    fixture_id: str | int | None,
+    fixture: Any,
+    odds: Any,
+    market: Any = None,
+    source: str = "API-Football odds monitor",
+    kickoff_at: str = "",
+    model_version: str = "",
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    created_at = datetime.now(timezone.utc).isoformat()
+    market_data = _market_data(market, odds)
+    kickoff_value = str(kickoff_at or _fixture_kickoff(fixture) or "")
+    captured_at = str(market_data.get("captured_at") or "")
+    fixture_key = str(fixture_id or market_data.get("fixture_id") or "")
+    created_time = _parse_datetime(created_at)
+    captured_time = _parse_datetime(captured_at)
+    kickoff_time = _parse_datetime(kickoff_value)
+    result = {
+        "fixtureId": fixture_key,
+        "source": source,
+        "capturedAt": captured_at,
+        "kickoffAt": kickoff_value,
+        "inserted": 0,
+        "skipped": 0,
+        "preMatch": False,
+        "closingCandidates": 0,
+        "reason": "",
+    }
+    if not fixture_key:
+        result["reason"] = "缺少 fixture_id，无法保存盘口快照。"
+        return result
+    if not captured_time or not kickoff_time:
+        result["reason"] = "缺少赔率时点或开赛时间，不能进入赛前盘口波动库。"
+        return result
+    if captured_time >= kickoff_time or (created_time and created_time >= kickoff_time):
+        result["reason"] = "赔率快照不是赛前记录，已隔离不入库。"
+        return result
+
+    quotes = _market_quote_entries(
+        fixture_id=fixture_key,
+        market=market_data,
+        kickoff_at=kickoff_value,
+        model_version=str(model_version or ""),
+    )
+    if not quotes:
+        result["reason"] = "未取得庄家优先级内完整全场盘口。"
+        return result
+
+    with connect(db_path) as conn:
+        before = conn.total_changes
+        for quote in quotes:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO odds_snapshots (
+                    created_at, fixture_id, source, bookmaker, captured_at, kickoff_at,
+                    model_version, market_type, line, line_key, selection,
+                    decimal_odds, market_probability, market_key, selection_key,
+                    is_primary, is_pre_match, is_closing_candidate
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+                """,
+                (
+                    created_at,
+                    fixture_key,
+                    source,
+                    quote["bookmaker"],
+                    quote["captured_at"],
+                    quote["kickoff_at"],
+                    quote["model_version"],
+                    quote["market_type"],
+                    quote["line"],
+                    quote["line_key"],
+                    quote["selection"],
+                    quote["decimal_odds"],
+                    quote["market_probability"],
+                    quote["market_key"],
+                    quote["selection_key"],
+                    quote["is_primary"],
+                ),
+            )
+        inserted = conn.total_changes - before
+        _refresh_closing_candidates(conn, fixture_key)
+        closing = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM odds_snapshots
+            WHERE fixture_id = ? AND is_closing_candidate = 1
+            """,
+            (fixture_key,),
+        ).fetchone()["count"]
+        conn.commit()
+
+    result.update(
+        {
+            "inserted": int(inserted),
+            "skipped": max(0, len(quotes) - int(inserted)),
+            "preMatch": True,
+            "closingCandidates": int(closing),
+            "reason": "已保存赛前盘口快照；当前同市场最新时点被标记为收盘候选。",
+        }
+    )
+    return result
+
+
+def odds_movement_coverage(db_path: str | Path | None = None) -> dict[str, int]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS snapshots,
+                COUNT(DISTINCT fixture_id) AS fixtures,
+                COUNT(DISTINCT fixture_id || ':' || captured_at) AS capture_points,
+                SUM(CASE WHEN is_pre_match = 1 THEN 1 ELSE 0 END) AS pre_match_quotes,
+                SUM(CASE WHEN is_closing_candidate = 1 THEN 1 ELSE 0 END) AS closing_candidates
+            FROM odds_snapshots
+            """
+        ).fetchone()
+    return {
+        "odds_snapshots": int(row["snapshots"] or 0),
+        "fixtures": int(row["fixtures"] or 0),
+        "capture_points": int(row["capture_points"] or 0),
+        "pre_match_quotes": int(row["pre_match_quotes"] or 0),
+        "closing_candidates": int(row["closing_candidates"] or 0),
+    }
+
+
 def market_dataset_coverage(db_path: str | Path | None = None) -> dict[str, int]:
     with connect(db_path) as conn:
         rows = conn.execute(
@@ -576,6 +743,7 @@ def market_dataset_coverage(db_path: str | Path | None = None) -> dict[str, int]
         pinnacle_quotes = conn.execute(
             "SELECT COUNT(*) AS count FROM market_quotes WHERE lower(bookmaker) = lower('Pinnacle')"
         ).fetchone()["count"]
+        odds_coverage = odds_movement_coverage(db_path)
     with_time = 0
     eligible_pre_match = 0
     post_kickoff = 0
@@ -603,6 +771,10 @@ def market_dataset_coverage(db_path: str | Path | None = None) -> dict[str, int]
         "snapshots_with_odds_time": with_time,
         "eligible_pre_match_snapshots": eligible_pre_match,
         "post_kickoff_snapshots": post_kickoff,
+        "odds_movement_quotes": odds_coverage["odds_snapshots"],
+        "odds_movement_capture_points": odds_coverage["capture_points"],
+        "odds_movement_fixtures": odds_coverage["fixtures"],
+        "closing_candidate_quotes": odds_coverage["closing_candidates"],
     }
 
 
@@ -732,6 +904,40 @@ def pending_result_fixtures(db_path: str | Path | None = None) -> list[str]:
     return sorted(eligible)
 
 
+def pending_paper_ledger_result_fixtures(
+    db_path: str | Path | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    eligible = set(pending_result_fixtures(db_path=db_path))
+    if not eligible:
+        return []
+    current = now or datetime.now(timezone.utc)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT
+                l.fixture_id,
+                s.kickoff_at
+            FROM paper_bankroll_ledger AS l
+            JOIN prediction_runs AS p
+                ON p.id = l.run_id
+            JOIN api_snapshots AS s
+                ON s.id = p.snapshot_id
+            LEFT JOIN match_results AS r
+                ON r.fixture_id = l.fixture_id
+            WHERE l.status = 'OPEN'
+              AND r.fixture_id IS NULL
+            """
+        ).fetchall()
+    due: set[str] = set()
+    for row in rows:
+        fixture_id = str(row["fixture_id"] or "")
+        kickoff = _parse_datetime(row["kickoff_at"])
+        if fixture_id in eligible and kickoff and current >= kickoff:
+            due.add(fixture_id)
+    return sorted(due)
+
+
 def storage_health(db_path: str | Path | None = None) -> dict[str, Any]:
     path = Path(db_path) if db_path else default_db_path()
     with connect(path) as conn:
@@ -739,6 +945,7 @@ def storage_health(db_path: str | Path | None = None) -> dict[str, Any]:
         snapshots = conn.execute("SELECT COUNT(*) AS count FROM api_snapshots").fetchone()["count"]
         results = conn.execute("SELECT COUNT(*) AS count FROM match_results").fetchone()["count"]
         quotes = conn.execute("SELECT COUNT(*) AS count FROM market_quotes").fetchone()["count"]
+        odds_snapshots = conn.execute("SELECT COUNT(*) AS count FROM odds_snapshots").fetchone()["count"]
         ledger = conn.execute("SELECT COUNT(*) AS count FROM paper_bankroll_ledger").fetchone()["count"]
         open_ledger = conn.execute(
             "SELECT COUNT(*) AS count FROM paper_bankroll_ledger WHERE status = 'OPEN'"
@@ -756,6 +963,7 @@ def storage_health(db_path: str | Path | None = None) -> dict[str, Any]:
         "api_snapshots": int(snapshots),
         "match_results": int(results),
         "market_quotes": int(quotes),
+        "odds_snapshots": int(odds_snapshots),
         "paper_ledger_entries": int(ledger),
         "paper_ledger_open": int(open_ledger),
         "paper_ledger_settled": int(settled_ledger),
@@ -903,6 +1111,25 @@ def _insert_paper_ledger_entries(
         elif action not in {"BUY", "PAPER_BUY"} or stake <= 0:
             continue
         market_name = str(item.get("market") or "")
+        selection = str(item.get("selection") or "")
+        line_value = _optional_float(item.get("line"))
+        duplicate = conn.execute(
+            """
+            SELECT id
+            FROM paper_bankroll_ledger
+            WHERE fixture_id = ?
+              AND market = ?
+              AND selection = ?
+              AND (
+                (line IS NULL AND ? IS NULL)
+                OR (line IS NOT NULL AND ? IS NOT NULL AND ABS(line - ?) < 0.000001)
+              )
+            LIMIT 1
+            """,
+            (fixture_id, market_name, selection, line_value, line_value, line_value),
+        ).fetchone()
+        if duplicate:
+            continue
         remaining = max(0.0, remaining - stake)
         conn.execute(
             """
@@ -920,13 +1147,13 @@ def _insert_paper_ledger_entries(
                 int(run_id),
                 fixture_id,
                 market_name,
-                str(item.get("selection") or ""),
-                _optional_float(item.get("line")),
+                selection,
+                line_value,
                 _bookmaker_for_recommendation(market_name, selected_bookmakers, fallback_bookmaker),
                 _optional_float(item.get("odds")),
                 _optional_float(item.get("model_probability")),
                 _optional_float(item.get("market_probability")),
-                _optional_float(item.get("expected_value_per_unit")),
+                _ledger_expected_value(item),
                 _optional_float(item.get("ev_pbase_research")),
                 _optional_float(item.get("ev_pfinal_exec")),
                 signal_status,
@@ -939,6 +1166,23 @@ def _insert_paper_ledger_entries(
                 str(item.get("reason") or ""),
             ),
         )
+
+
+def _ledger_expected_value(item: dict[str, Any]) -> float | None:
+    action = str(item.get("action") or "")
+    signal_status = str(item.get("signal_status") or "")
+    if action == "PAPER_BUY" or signal_status == "PAPER_BUY":
+        value = _optional_float(item.get("paper_expected_value_per_unit"))
+        if value is not None:
+            return value
+        value = _optional_float(item.get("ev_pshr_candidate"))
+        if value is not None:
+            return value
+    if action == "BUY":
+        value = _optional_float(item.get("ev_pfinal_exec"))
+        if value is not None:
+            return value
+    return _optional_float(item.get("expected_value_per_unit"))
 
 
 def _bookmaker_for_recommendation(market_name: str, selected_bookmakers: dict[str, Any], fallback: str) -> str:
@@ -1005,10 +1249,52 @@ def _insert_market_quotes(
     kickoff_at: str,
     model_version: str,
 ) -> None:
+    for quote in _market_quote_entries(
+        fixture_id=fixture_id,
+        market=market,
+        kickoff_at=kickoff_at,
+        model_version=model_version,
+    ):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO market_quotes (
+                snapshot_id, fixture_id, bookmaker, captured_at, kickoff_at,
+                model_version, market_type, line, line_key, selection,
+                decimal_odds, market_probability, market_key, selection_key, is_primary
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                fixture_id,
+                quote["bookmaker"],
+                quote["captured_at"],
+                quote["kickoff_at"],
+                quote["model_version"],
+                quote["market_type"],
+                quote["line"],
+                quote["line_key"],
+                quote["selection"],
+                quote["decimal_odds"],
+                quote["market_probability"],
+                quote["market_key"],
+                quote["selection_key"],
+                quote["is_primary"],
+            ),
+        )
+
+
+def _market_quote_entries(
+    *,
+    fixture_id: str,
+    market: dict[str, Any],
+    kickoff_at: str,
+    model_version: str,
+) -> list[dict[str, Any]]:
     selected_bookmakers = market.get("selected_bookmakers") or {}
     fallback_bookmaker = str(market.get("selected_bookmaker") or "")
     if not fallback_bookmaker and not selected_bookmakers:
-        return
+        return []
     captured_at = str(market.get("captured_at") or "")
     groups: list[tuple[str, float | None, dict[str, float], bool, str]] = []
     winner = market.get("match_winner") or {}
@@ -1027,6 +1313,7 @@ def _insert_market_quotes(
         for line, odds in handicaps.items()
     )
 
+    entries: list[dict[str, Any]] = []
     for market_type, line, odds, is_primary, bookmaker in groups:
         if not bookmaker:
             continue
@@ -1037,33 +1324,59 @@ def _insert_market_quotes(
             if decimal_odds <= 1.0 or selection not in probabilities:
                 continue
             selection_key = f"{market_key}:{selection}"
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO market_quotes (
-                    snapshot_id, fixture_id, bookmaker, captured_at, kickoff_at,
-                    model_version, market_type, line, line_key, selection,
-                    decimal_odds, market_probability, market_key, selection_key, is_primary
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_id,
-                    fixture_id,
-                    bookmaker,
-                    captured_at,
-                    kickoff_at,
-                    model_version,
-                    market_type,
-                    line,
-                    line_key,
-                    selection,
-                    float(decimal_odds),
-                    probabilities[selection],
-                    market_key,
-                    selection_key,
-                    int(is_primary),
-                ),
+            entries.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker": bookmaker,
+                    "bookmaker": bookmaker,
+                    "captured_at": captured_at,
+                    "kickoff_at": kickoff_at,
+                    "model_version": model_version,
+                    "market_type": market_type,
+                    "line": line,
+                    "line_key": line_key,
+                    "selection": selection,
+                    "decimal_odds": float(decimal_odds),
+                    "market_probability": probabilities[selection],
+                    "market_key": market_key,
+                    "selection_key": selection_key,
+                    "is_primary": int(is_primary),
+                }
             )
+    return entries
+
+
+def _refresh_closing_candidates(conn: sqlite3.Connection, fixture_id: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, bookmaker, market_type, line_key, selection, captured_at
+        FROM odds_snapshots
+        WHERE fixture_id = ? AND is_pre_match = 1
+        """,
+        (fixture_id,),
+    ).fetchall()
+    latest: dict[tuple[str, str, str, str], tuple[str, int]] = {}
+    for row in rows:
+        key = (
+            str(row["bookmaker"] or ""),
+            str(row["market_type"] or ""),
+            str(row["line_key"] or ""),
+            str(row["selection"] or ""),
+        )
+        captured = str(row["captured_at"] or "")
+        current = latest.get(key)
+        if current is None or captured > current[0]:
+            latest[key] = (captured, int(row["id"]))
+    candidate_ids = {value[1] for value in latest.values()}
+    conn.execute(
+        "UPDATE odds_snapshots SET is_closing_candidate = 0 WHERE fixture_id = ?",
+        (fixture_id,),
+    )
+    if candidate_ids:
+        conn.executemany(
+            "UPDATE odds_snapshots SET is_closing_candidate = 1 WHERE id = ?",
+            [(item,) for item in candidate_ids],
+        )
 
 
 def _float_line_groups(raw_groups: dict[Any, Any]) -> dict[float, dict[str, float]]:

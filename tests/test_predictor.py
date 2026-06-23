@@ -1,3 +1,4 @@
+import math
 import unittest
 
 from worldcup_predictor.models import Fixture, ModelConfig, PredictionResult, TeamProfile
@@ -34,6 +35,37 @@ class PredictorTest(unittest.TestCase):
 
         self.assertGreater(result.final_probabilities["home_win"], result.final_probabilities["away_win"])
         self.assertTrue(0.99 < sum(result.final_probabilities.values()) < 1.01)
+
+    def test_exp_edge_audit_matches_raw_expected_goals(self):
+        home = TeamProfile(name="A", elo=1700, fifa_rank=30, attack_rating=1.18, defense_rating=1.08)
+        away = TeamProfile(name="B", elo=1580, fifa_rank=70, attack_rating=0.96, defense_rating=0.92)
+        fixture = Fixture(
+            match_id="A-B",
+            home_team="A",
+            away_team="B",
+            neutral_site=False,
+            rest_days_home=6,
+            rest_days_away=4,
+            h2h_edge_home=0.2,
+        )
+
+        result = predict_match(home, away, fixture, ModelConfig(market_weight=0))
+
+        self.assertIsNotNone(result.base_expected_goals_home)
+        self.assertIsNotNone(result.base_expected_goals_away)
+        self.assertIsNotNone(result.log_edge)
+        self.assertAlmostEqual(result.home_exp_multiplier, math.exp(result.log_edge), places=12)
+        self.assertAlmostEqual(result.away_exp_multiplier, math.exp(-result.log_edge), places=12)
+        self.assertAlmostEqual(
+            result.raw_expected_goals_home,
+            result.base_expected_goals_home * result.home_exp_multiplier,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            result.raw_expected_goals_away,
+            result.base_expected_goals_away * result.away_exp_multiplier,
+            places=12,
+        )
 
     def test_parse_api_football_odds_snapshot(self):
         rows = [
@@ -419,7 +451,7 @@ class PredictorTest(unittest.TestCase):
         self.assertIn("模型分歧异常", recommendations[0].reason)
         self.assertEqual(portfolio.active_bets, 0)
 
-    def test_pinnacle_1x2_model_divergence_suspends_ev_for_all_markets(self):
+    def test_pinnacle_1x2_model_divergence_suspends_match_winner_only(self):
         result = PredictionResult(
             match_id="1545408",
             home_team="Saint Etienne",
@@ -447,15 +479,24 @@ class PredictorTest(unittest.TestCase):
             unit_stake=10,
         )
 
-        self.assertTrue(all(item.action == "WATCH" for item in recommendations))
-        self.assertTrue(all(item.signal_status == "SUSPENDED" for item in recommendations))
-        self.assertTrue(all(item.ev_status == "MODEL_MARKET_CONFLICT" for item in recommendations))
-        self.assertTrue(all(item.expected_value_per_unit is None for item in recommendations))
+        self.assertEqual(recommendations[0].signal_status, "SUSPENDED")
+        self.assertEqual(recommendations[0].ev_status, "MODEL_MARKET_CONFLICT")
+        self.assertIsNone(recommendations[0].expected_value_per_unit)
         self.assertAlmostEqual(recommendations[0].audit_expected_value_per_unit, 0.6314326233)
         self.assertAlmostEqual(recommendations[0].ev_pbase_research, 0.6314326233)
         self.assertIsNone(recommendations[0].ev_pfinal_exec)
-        self.assertIn("本场所有市场 EV 暂停计算", recommendations[1].reason)
-        self.assertEqual(portfolio.total_stake, 0)
+        self.assertIn("胜平负 EV 暂停计算", recommendations[0].reason)
+        self.assertIn("MATCH_WINNER_MODEL_MARKET_DIVERGENCE", recommendations[1].risk_flags)
+        self.assertEqual(recommendations[1].action, "PAPER_BUY")
+        self.assertEqual(recommendations[1].signal_status, "PAPER_BUY")
+        self.assertEqual(recommendations[1].ev_status, "PAPER_OBSERVATION")
+        self.assertIsNotNone(recommendations[1].expected_value_per_unit)
+        self.assertIsNotNone(recommendations[1].paper_expected_value_per_unit)
+        self.assertEqual(recommendations[1].stake, 10)
+        self.assertEqual(recommendations[2].signal_status, "SUSPENDED")
+        self.assertEqual(recommendations[2].ev_status, "MODEL_MARKET_CONFLICT")
+        self.assertEqual(portfolio.active_bets, 1)
+        self.assertEqual(portfolio.total_stake, 10)
 
     def test_single_market_probability_gap_suspends_that_market_ev_only(self):
         result = PredictionResult(
@@ -585,9 +626,9 @@ class PredictorTest(unittest.TestCase):
         recommendations, _ = build_recommendations(result, {}, market, unit_stake=10)
         calculation = recommendations[0].ev_calculation
 
-        self.assertEqual(recommendations[0].selection, "Udinese 胜")
-        self.assertAlmostEqual(recommendations[0].expected_value_per_unit, 0.7388)
-        self.assertAlmostEqual(recommendations[0].ev_pbase_research, 0.7388)
+        self.assertEqual(recommendations[0].selection, "Napoli 胜")
+        self.assertAlmostEqual(recommendations[0].expected_value_per_unit, -0.159)
+        self.assertAlmostEqual(recommendations[0].ev_pbase_research, -0.159)
         self.assertIsNone(recommendations[0].ev_pfinal_exec)
         self.assertEqual(recommendations[0].ev_layer, "pbase_research")
         self.assertEqual(recommendations[0].model_probability_label, "模型胜率")
@@ -597,10 +638,38 @@ class PredictorTest(unittest.TestCase):
         self.assertEqual(calculation["evProbabilityBasis"], "pbase_result_probability")
         self.assertFalse(calculation["formalExecutionEnabled"])
         self.assertEqual(calculation["formula"], "EV = pbase × odds - 1")
-        self.assertAlmostEqual(calculation["winStakeFraction"], 0.23)
-        self.assertAlmostEqual(calculation["lossStakeFraction"], 0.77)
-        self.assertAlmostEqual(calculation["breakEvenOdds"], 1 / 0.23)
-        self.assertTrue(any(gate["key"] == "model_probability" and not gate["passed"] for gate in calculation["gates"]))
+        self.assertAlmostEqual(calculation["winStakeFraction"], 0.58)
+        self.assertAlmostEqual(calculation["lossStakeFraction"], 0.42)
+        self.assertAlmostEqual(calculation["breakEvenOdds"], 1 / 0.58)
+        self.assertTrue(any(gate["key"] == "model_probability" and gate["passed"] for gate in calculation["gates"]))
+        self.assertTrue(any(gate["key"] == "max_odds" and gate["passed"] for gate in calculation["gates"]))
+        self.assertTrue(any(gate["key"] == "ev" and not gate["passed"] for gate in calculation["gates"]))
+
+    def test_high_odds_1x2_direction_is_research_watch_only(self):
+        result = PredictionResult(
+            match_id="106",
+            home_team="A",
+            away_team="B",
+            expected_goals_home=1.1,
+            expected_goals_away=1.7,
+            model_probabilities={"home_win": 0.42, "draw": 0.25, "away_win": 0.33},
+            market_probabilities=None,
+            final_probabilities={"home_win": 0.42, "draw": 0.25, "away_win": 0.33},
+            top_scores=[],
+            feature_edges={},
+        )
+        market = MarketSnapshot(match_winner={"home_win": 4.60, "draw": 4.00, "away_win": 4.20})
+
+        recommendations, portfolio = build_recommendations(result, {}, market, unit_stake=100)
+        match_winner = recommendations[0]
+
+        self.assertEqual(match_winner.selection, "A 胜")
+        self.assertEqual(match_winner.action, "WATCH")
+        self.assertEqual(match_winner.ev_status, "RESEARCH_ONLY")
+        self.assertEqual(match_winner.stake, 0.0)
+        self.assertIn("高于高赔率复核上限", match_winner.reason)
+        self.assertTrue(any(gate["key"] == "max_odds" and not gate["passed"] for gate in match_winner.ev_calculation["gates"]))
+        self.assertEqual(portfolio.active_bets, 0)
 
     def test_asian_total_ev_path_splits_half_loss_and_break_even_odds(self):
         result = PredictionResult(
@@ -627,19 +696,23 @@ class PredictorTest(unittest.TestCase):
         settlement = total.ev_calculation["settlement"]
 
         self.assertEqual(total.selection, "大 2.25")
+        self.assertEqual(total.action, "WATCH")
+        self.assertEqual(total.signal_status, "RESEARCH_WATCH")
+        self.assertEqual(total.decision_status, "RESEARCH_OBSERVATION")
         self.assertEqual(total.model_probability_label, "正收益概率")
         self.assertEqual(total.ev_probability_basis, "asian_settlement_weight")
         self.assertEqual(total.ev_calculation["modelProbabilityLabel"], "正收益概率")
         self.assertEqual(total.ev_calculation["evProbabilityBasis"], "asian_settlement_weight")
         self.assertAlmostEqual(total.expected_value_per_unit, 0.125)
-        self.assertIsNone(total.paper_expected_value_per_unit)
-        self.assertIsNone(total.adjusted_probability)
-        self.assertIsNone(total.shrink_k)
-        self.assertEqual(total.ev_calculation["evDecisionLayer"], "research_audit_only")
-        self.assertIsNone(total.ev_calculation["paperExpectedValue"])
-        self.assertTrue(any(gate["key"] == "paper_ev" and not gate["enabled"] for gate in total.ev_calculation["gates"]))
-        self.assertIn("SCORE_DISTRIBUTION_NOT_VALIDATED", total.risk_flags)
-        self.assertIn("比分分布层尚未完成独立校准", total.reason)
+        self.assertAlmostEqual(total.paper_expected_value_per_unit, 0.05625)
+        self.assertAlmostEqual(total.adjusted_probability, 0.50)
+        self.assertAlmostEqual(total.shrink_k, 0.45)
+        self.assertEqual(total.stake, 0.0)
+        self.assertEqual(total.ev_calculation["evLayer"], "pbase_research")
+        self.assertAlmostEqual(total.ev_calculation["paperExpectedValue"], 0.05625)
+        self.assertFalse(total.ev_calculation["paperSimulationEnabled"])
+        self.assertEqual(total.ev_calculation["evDecisionLayer"], "paper_research_open")
+        self.assertTrue(any(gate["key"] == "paper_ev" and gate["enabled"] for gate in total.ev_calculation["gates"]))
         self.assertAlmostEqual(total.ev_calculation["positiveReturnProbability"], 0.50)
         self.assertAlmostEqual(settlement["fullWinProbability"], 0.50)
         self.assertAlmostEqual(settlement["halfLossProbability"], 0.25)
@@ -648,7 +721,7 @@ class PredictorTest(unittest.TestCase):
         self.assertAlmostEqual(total.ev_calculation["lossStakeFraction"], 0.375)
         self.assertAlmostEqual(total.ev_calculation["breakEvenOdds"], 1.75)
 
-    def test_single_match_exposure_cap_scales_multiple_paper_signals(self):
+    def test_score_markets_enter_paper_simulation_when_force_picks(self):
         result = PredictionResult(
             match_id="105",
             home_team="A",
@@ -677,10 +750,19 @@ class PredictorTest(unittest.TestCase):
         )
 
         active = [item for item in recommendations if item.action in {"BUY", "PAPER_BUY"}]
-        self.assertEqual(len(active), 1)
-        self.assertEqual(recommendations[1].decision_status, "RESEARCH_OBSERVATION")
-        self.assertEqual(recommendations[2].decision_status, "RESEARCH_OBSERVATION")
-        self.assertAlmostEqual(portfolio.total_stake, 200.0)
+        self.assertEqual(len(active), 3)
+        self.assertEqual(recommendations[1].decision_status, "PAPER_OBSERVATION")
+        self.assertEqual(recommendations[2].decision_status, "PAPER_OBSERVATION")
+        self.assertEqual(recommendations[1].action, "PAPER_BUY")
+        self.assertEqual(recommendations[2].action, "PAPER_BUY")
+        self.assertIsNotNone(recommendations[1].paper_expected_value_per_unit)
+        self.assertIsNotNone(recommendations[2].paper_expected_value_per_unit)
+        self.assertAlmostEqual(portfolio.total_stake, 400.0)
+        self.assertAlmostEqual(recommendations[0].stake, 400.0 / 3)
+        self.assertAlmostEqual(recommendations[1].stake, 400.0 / 3)
+        self.assertAlmostEqual(recommendations[2].stake, 400.0 / 3)
+        expected_profit = sum(item.stake * (item.paper_expected_value_per_unit or 0.0) for item in active)
+        self.assertAlmostEqual(portfolio.expected_profit, expected_profit)
 
 
 if __name__ == "__main__":

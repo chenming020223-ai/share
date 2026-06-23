@@ -20,7 +20,7 @@ class BankrollPlan:
     max_market_exposure: float = 0.0
     max_league_exposure: float = 0.0
     max_longshot_exposure: float = 0.0
-    risk_mode: str = "research_locked"
+    risk_mode: str = "paper_simulation"
 
 
 def dynamic_unit_stake(

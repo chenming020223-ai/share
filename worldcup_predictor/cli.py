@@ -265,7 +265,7 @@ def _ev(value: float | None) -> str:
 def _action_label(value: str) -> str:
     return {
         "BUY": "模型候选（未执行）",
-        "PAPER_BUY": "纸上观察",
+        "PAPER_BUY": "纸上模拟",
         "WATCH": "观望",
         "NO_MARKET": "市场缺失",
         "MODEL_CANDIDATE": "模型候选（未执行）",

@@ -16,16 +16,18 @@ def predict_match(
     config = config or ModelConfig()
     feature_edges = calculate_feature_edges(home, away, fixture, config)
 
-    home_rate = config.base_goals * _safe_ratio(home.attack_rating, away.defense_rating)
-    away_rate = config.base_goals * _safe_ratio(away.attack_rating, home.defense_rating)
+    base_home_rate = config.base_goals * _safe_ratio(home.attack_rating, away.defense_rating)
+    base_away_rate = config.base_goals * _safe_ratio(away.attack_rating, home.defense_rating)
 
     log_edge = sum(
         value
         for key, value in feature_edges.items()
         if key not in {"rivalry_draw_boost", "commercial_raw_edge", "country_relation_raw_edge"}
     )
-    home_rate *= math.exp(log_edge)
-    away_rate *= math.exp(-log_edge)
+    home_exp_multiplier = math.exp(log_edge)
+    away_exp_multiplier = math.exp(-log_edge)
+    home_rate = base_home_rate * home_exp_multiplier
+    away_rate = base_away_rate * away_exp_multiplier
 
     raw_home_rate = clamp(home_rate, 0.15, 4.5)
     raw_away_rate = clamp(away_rate, 0.15, 4.5)
@@ -68,6 +70,11 @@ def predict_match(
         score_matrix_probability_sum=matrix_prob_sum,
         score_matrix_tail_mass=max(0.0, 1.0 - matrix_prob_sum),
         lambda_risk_flags=tuple(lambda_risk_flags),
+        base_expected_goals_home=base_home_rate,
+        base_expected_goals_away=base_away_rate,
+        log_edge=log_edge,
+        home_exp_multiplier=home_exp_multiplier,
+        away_exp_multiplier=away_exp_multiplier,
     )
 
 

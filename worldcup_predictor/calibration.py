@@ -10,7 +10,7 @@ from .storage import calibration_source_rows, market_dataset_coverage
 OUTCOMES = ("home_win", "draw", "away_win")
 MARKET_DATASET_VERSION = "priority_bookmaker_fulltime_snapshot_v3"
 PBASE_MODEL_VERSION = "pbase_poisson_recent_form_v1"
-PSHR_MODEL_VERSION = "pshr_market_blend_timesplit_v1"
+PSHR_MODEL_VERSION = "pshr_outcome_bias_calibrated_pbase_v2"
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,9 @@ class CalibrationPolicy:
     min_validation_samples: int = 20
     max_log_loss_gap_to_market: float = 0.02
     max_brier_gap_to_market: float = 0.01
+    outcome_calibration_prior_samples: int = 20
+    min_outcome_factor: float = 0.75
+    max_outcome_factor: float = 1.35
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,21 @@ class CalibrationObservation:
     actual_key: str
 
 
+@dataclass(frozen=True)
+class PshrCandidate:
+    formula: str
+    market_weight: float
+    raw_market_weight: float | None
+    outcome_factors: dict[str, float]
+    outcome_actual_rates: dict[str, float]
+    outcome_predicted_rates: dict[str, float]
+    outcome_target_rates: dict[str, float]
+    prior_samples: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def build_model_validation_status(
     db_path: str | None = None,
     policy: CalibrationPolicy | None = None,
@@ -42,12 +60,12 @@ def build_model_validation_status(
     applied_policy = policy or CalibrationPolicy()
     observations, exclusions = _eligible_observations(calibration_source_rows(db_path=db_path))
     development, calibration, validation = _chronological_split(observations)
-    alpha = _fit_market_shrinkage_alpha(calibration) if calibration else None
+    pshr_fit = _fit_pshr_candidate(calibration, applied_policy) if calibration else None
 
     metrics = {
-        "development": _metric_pack(development, alpha),
-        "calibration": _metric_pack(calibration, alpha),
-        "validation": _metric_pack(validation, alpha),
+        "development": _metric_pack(development, pshr_fit),
+        "calibration": _metric_pack(calibration, pshr_fit),
+        "validation": _metric_pack(validation, pshr_fit),
     }
     checks = _acceptance_checks(observations, calibration, validation, metrics["validation"], applied_policy)
     qualified = bool(checks) and all(item["passed"] for item in checks)
@@ -85,13 +103,15 @@ def build_model_validation_status(
             "calibration": len(calibration),
             "validation": len(validation),
         },
-        "fittedMarketWeight": alpha,
+        "fittedMarketWeight": pshr_fit.market_weight if pshr_fit else None,
+        "rawCalibrationMarketWeight": pshr_fit.raw_market_weight if pshr_fit else None,
+        "pshrParameters": pshr_fit.to_dict() if pshr_fit else None,
         "metrics": metrics,
         "checks": checks,
         "excluded": exclusions,
         "notes": [
             "仅纳入在开赛前生成、具备庄家优先级全场赔率时点且已有 90 分钟赛果的真实 API 快照。",
-            "pshr 使用校准区间拟合市场收缩权重，验证区间只用于时间外评估。",
+            "pshr 使用校准区间拟合主胜/平/客胜类别偏差校准因子；市场概率作为对照基准，验证区间只用于时间外评估。",
             "当前时间切分验收对象为胜平负三分类概率；大小球与让球仍需独立的比分分布校准验收。",
             "即使达到待审批条件，正式 EV 仍保持关闭，须另行确认 pfinal 公式与策略回测。",
         ],
@@ -177,15 +197,61 @@ def _fit_market_shrinkage_alpha(observations: list[CalibrationObservation]) -> f
     )
 
 
-def _metric_pack(observations: list[CalibrationObservation], alpha: float | None) -> dict[str, Any]:
+def _fit_pshr_candidate(observations: list[CalibrationObservation], policy: CalibrationPolicy) -> PshrCandidate | None:
+    if not observations:
+        return None
+    raw_market_weight = _fit_market_shrinkage_alpha(observations)
+    factors, actual_rates, predicted_rates, target_rates = _fit_outcome_factors(observations, policy)
+    return PshrCandidate(
+        formula="outcome_bias_calibrated_pbase",
+        market_weight=0.0,
+        raw_market_weight=raw_market_weight,
+        outcome_factors=factors,
+        outcome_actual_rates=actual_rates,
+        outcome_predicted_rates=predicted_rates,
+        outcome_target_rates=target_rates,
+        prior_samples=policy.outcome_calibration_prior_samples,
+    )
+
+
+def _fit_outcome_factors(
+    observations: list[CalibrationObservation],
+    policy: CalibrationPolicy,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+    count = len(observations)
+    predicted_rates = {
+        key: sum(item.pbase[key] for item in observations) / count
+        for key in OUTCOMES
+    }
+    actual_rates = {
+        key: sum(1.0 for item in observations if item.actual_key == key) / count
+        for key in OUTCOMES
+    }
+    prior = max(0, policy.outcome_calibration_prior_samples)
+    target_rates = {
+        key: (actual_rates[key] * count + predicted_rates[key] * prior) / (count + prior)
+        for key in OUTCOMES
+    }
+    factors = {
+        key: _clamp(
+            target_rates[key] / predicted_rates[key] if predicted_rates[key] > 0 else 1.0,
+            policy.min_outcome_factor,
+            policy.max_outcome_factor,
+        )
+        for key in OUTCOMES
+    }
+    return factors, actual_rates, predicted_rates, target_rates
+
+
+def _metric_pack(observations: list[CalibrationObservation], pshr_fit: PshrCandidate | None) -> dict[str, Any]:
     result: dict[str, Any] = {
         "samples": len(observations),
         "pbase": _probability_metrics(observations, lambda item: item.pbase),
         "qmkt": _probability_metrics(observations, lambda item: item.qmkt),
         "pshr": None,
     }
-    if alpha is not None:
-        result["pshr"] = _probability_metrics(observations, lambda item: _shrink_probability(item, alpha))
+    if pshr_fit is not None:
+        result["pshr"] = _probability_metrics(observations, lambda item: _pshr_probability(item, pshr_fit))
     return result
 
 
@@ -287,6 +353,25 @@ def _shrink_probability(item: CalibrationObservation, alpha: float) -> dict[str,
     }
 
 
+def _pshr_probability(item: CalibrationObservation, pshr_fit: PshrCandidate) -> dict[str, float]:
+    calibrated = {
+        key: item.pbase[key] * pshr_fit.outcome_factors[key]
+        for key in OUTCOMES
+    }
+    total = sum(calibrated.values())
+    if total <= 0:
+        return item.pbase
+    pbase_calibrated = {key: value / total for key, value in calibrated.items()}
+    if pshr_fit.market_weight <= 0:
+        return pbase_calibrated
+    blended = {
+        key: (1.0 - pshr_fit.market_weight) * pbase_calibrated[key] + pshr_fit.market_weight * item.qmkt[key]
+        for key in OUTCOMES
+    }
+    total = sum(blended.values())
+    return {key: value / total for key, value in blended.items()}
+
+
 def _normalized_probabilities(raw: Any) -> dict[str, float] | None:
     if not isinstance(raw, dict):
         return None
@@ -298,6 +383,10 @@ def _normalized_probabilities(raw: Any) -> dict[str, float] | None:
     if total <= 0:
         return None
     return {key: value / total for key, value in values.items()}
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return min(upper, max(lower, value))
 
 
 def _parse_time(value: Any) -> datetime | None:

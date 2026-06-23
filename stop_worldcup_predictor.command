@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")"
 
-PORT="${WORLDCUP_WEB_PORT:-8766}"
+PORT="${WORLDCUP_WEB_PORT:-8765}"
 PID_FILE="storage/web_server.pid"
 SERVICE_LABEL="com.worldcup.predictor.web.v2"
 SCREEN_NAME="worldcup_predictor_web_v2"

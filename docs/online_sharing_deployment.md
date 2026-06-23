@@ -1,7 +1,7 @@
 # 公网分享部署说明
 
 日期：2026-05-27  
-目标：向受邀体验者发送网页链接，由服务器统一获取 API-Football 数据并生成中文分析报告。
+目标：向受邀体验者发送网页链接，由服务器统一获取 API-Football 数据并生成中文赛前分析、纸上模拟舱和赛后审计。
 
 ## 一、交付模式
 
@@ -36,11 +36,34 @@
    - `API_FOOTBALL_KEY`：新生成的 API-Football 密钥。
    - `WORLDCUP_ACCESS_PASSWORD`：提供给受邀体验者的访问口令。
 4. Render 完成部署后会提供公网网址。
-5. 用电脑和手机各进行一次预测、Excel/PDF 导出和刷新后历史保存验收。
+5. 用电脑和手机各进行一次预测、模拟舱账本刷新和历史保存验收。
 
 `render.yaml` 配置了持久磁盘，因此该路线需要 Render 的付费 Web Service；这是因为 SQLite 历史记录和模型样本不能依赖临时文件系统。
 
-## 五、甲方需要提供
+当前 Render 配置口径：
+
+- 服务计划：`starter`。
+- 持久磁盘：`1GB`，挂载到 `/opt/render/project/src/storage`。
+- 数据库：`/opt/render/project/src/storage/worldcup_predictor.sqlite3`。
+- API 缓存：`/opt/render/project/src/storage/api_cache`。
+- 共享模式：`WORLDCUP_PUBLIC_MODE=true`，页面隐藏 API 密钥输入框。
+- 访问保护：用户名默认 `viewer`，口令由 Render Secret 填写。
+- 自动结算：每 5 分钟检查一次已完赛模拟舱纸上单，只在 API 返回 90 分钟比分后结算。
+- 当前费用预估：Render Starter Web Service 约 `$7/月`，1GB 持久磁盘约 `$0.25/月`，合计约 `$7.25/月`，不含 API-Football 自身费用。
+
+## 五、部署前检查清单
+
+必须确认：
+
+- `.env` 不上传；API key 只填在 Render Secret。
+- `storage/` 本地数据库、日志和缓存不上传；线上从空库启动，后续保存在 Render 磁盘。
+- `render.yaml` 位于仓库根目录。
+- `requirements.txt` 包含运行依赖。
+- `/healthz` 返回 `200`。
+- 错误口令访问首页返回 `401`，正确口令返回 `200`。
+- 正式 EV / 真实下注保持关闭，页面只作为研究验证和纸上模拟舱。
+
+## 六、甲方需要提供
 
 - 托管选择：建议确认采用 Render。
 - 一个可连接部署的 GitHub 私有仓库，或允许协助创建仓库并发布。
@@ -48,11 +71,11 @@
 - 希望设置的共享访问用户名和访问口令。
 - 是否允许受邀用户看到共同的“历史报告”和“模型审计”数据。
 
-## 六、验收标准
+## 七、验收标准
 
 - 通过公网 HTTPS 链接访问，并在输入正确口令后打开界面。
 - 分享模式页面不显示 `API 密钥` 输入框。
 - 可选择真实比赛并生成预测，队名规则为“已核定中文优先、否则显示 API 原名”。
-- 可导出中文 Excel 和 PDF。
+- 可查看中文赛前分析、模拟舱账本、模型审计和赛后复盘；PDF/Excel 导出仍按当前项目口径暂时下线。
 - 服务重新部署或重启后，历史预测仍保留。
 - 错误口令不能访问页面或 API。

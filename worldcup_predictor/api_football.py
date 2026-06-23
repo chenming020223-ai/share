@@ -188,6 +188,20 @@ class ApiFootballClient:
     def team_last_fixtures(self, team_id: int, limit: int = 10, timezone: str = "Asia/Shanghai") -> list[dict[str, Any]]:
         return self.fixtures({"team": team_id, "last": limit, "timezone": timezone})
 
+    def team_finished_fixtures_until(
+        self,
+        team_id: int,
+        to_date: str,
+        limit: int = 30,
+        timezone: str = "Asia/Shanghai",
+    ) -> list[dict[str, Any]]:
+        rows = self.fixtures({"team": team_id, "to": to_date, "timezone": timezone})
+        return sorted(
+            rows,
+            key=lambda item: str(((item.get("fixture") or {}).get("date") or "")),
+            reverse=True,
+        )[:limit]
+
     def odds(self, fixture_id: int) -> list[dict[str, Any]]:
         data = self.get("odds", {"fixture": fixture_id})
         return list(data.get("response", []))

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .api_football import ApiFootballClient, ApiTeam
@@ -25,6 +27,7 @@ from .models import Fixture, ModelConfig, PredictionResult, TeamProfile, as_floa
 from .predictor import predict_match
 from .poisson import score_matrix
 from .risk import build_match_risk_context
+from .score_calibration import build_score_distribution_calibration_status
 from .settings import env_int, env_list, env_str
 from .team_strength import blend_profile_with_prior, opponent_strength_elo, team_strength_prior
 
@@ -67,6 +70,8 @@ class AutoPrediction:
     data_notes: list[str] = field(default_factory=list)
     raw_snapshot: dict[str, Any] = field(default_factory=dict)
     risk_context: dict[str, Any] = field(default_factory=dict)
+    historical_mode: bool = False
+    historical_as_of: str | None = None
 
 
 def run_auto_prediction(
@@ -82,9 +87,15 @@ def run_auto_prediction(
     collection_mode: str | None = None,
     client: ApiFootballClient | None = None,
     bookmaker_priority: list[str] | tuple[str, ...] | str | None = None,
+    historical_as_of: str | datetime | None = None,
+    score_distribution_calibration: dict[str, Any] | None = None,
+    starting_bankroll: float = 1000.0,
+    realized_pnl: float | None = None,
+    reserved_stake: float = 0.0,
 ) -> AutoPrediction:
     active_mode = _normalize_collection_mode(collection_mode)
     source = client or ApiFootballClient(api_key=api_key)
+    historical_mode = historical_as_of is not None
     search_home_name = to_api_name("team", home_name)
     search_away_name = to_api_name("team", away_name)
     if fixture_id:
@@ -97,7 +108,11 @@ def run_auto_prediction(
         fixture_row = source.next_head_to_head(requested_home.id, requested_away.id)
 
     fixture_meta = fixture_row.get("fixture") or {}
-    _validate_pre_match_fixture(fixture_meta)
+    historical_cutoff: datetime | None = None
+    if historical_mode:
+        historical_cutoff = _historical_cutoff_from_fixture(fixture_meta, historical_as_of)
+    else:
+        _validate_pre_match_fixture(fixture_meta)
     league_meta = fixture_row.get("league") or {}
     teams_meta = fixture_row.get("teams") or {}
     home_meta = teams_meta.get("home") or {}
@@ -121,20 +136,37 @@ def run_auto_prediction(
     season = _optional_int(league_meta.get("season"))
     notes: list[str] = []
 
+    if historical_mode and historical_cutoff:
+        notes.append(
+            "历史赛前模拟模式：本次只允许使用 "
+            f"{historical_cutoff.astimezone(timezone.utc).isoformat()} 前已存在的数据；"
+            "赛果只可用于后续结算，不进入正式赛前快照和 pfinal 验收。"
+        )
     odds_rows = _safe_call(lambda: source.odds(fixture_api_id), notes, "赔率数据不可用")
+    if historical_mode and historical_cutoff:
+        original_odds_count = len(odds_rows or [])
+        odds_rows = _odds_rows_before_cutoff(odds_rows or [], historical_cutoff)
+        if original_odds_count and not odds_rows:
+            notes.append("历史赛前模拟：API 返回的盘口没有可审计的赛前更新时间，已排除，盘口按缺失处理。")
+        elif original_odds_count != len(odds_rows or []):
+            notes.append(f"历史赛前模拟：已排除 {original_odds_count - len(odds_rows or [])} 条开赛后或无时点盘口。")
     priority = normalize_active_bookmaker_priority(bookmaker_priority)
     market = parse_api_football_odds(odds_rows or [], required_bookmaker=None, bookmaker_priority=priority)
 
-    home_recent_rows = _safe_call(
-        lambda: source.team_last_fixtures(actual_home.id, RECENT_MATCH_FETCH_COUNT),
-        notes,
-        "主队近期比赛不可用",
-    ) or []
-    away_recent_rows = _safe_call(
-        lambda: source.team_last_fixtures(actual_away.id, RECENT_MATCH_FETCH_COUNT),
-        notes,
-        "客队近期比赛不可用",
-    ) or []
+    if historical_mode and historical_cutoff:
+        home_recent_rows = _team_recent_rows_before_cutoff(source, actual_home.id, historical_cutoff, notes, "主队")
+        away_recent_rows = _team_recent_rows_before_cutoff(source, actual_away.id, historical_cutoff, notes, "客队")
+    else:
+        home_recent_rows = _safe_call(
+            lambda: source.team_last_fixtures(actual_home.id, RECENT_MATCH_FETCH_COUNT),
+            notes,
+            "主队近期比赛不可用",
+        ) or []
+        away_recent_rows = _safe_call(
+            lambda: source.team_last_fixtures(actual_away.id, RECENT_MATCH_FETCH_COUNT),
+            notes,
+            "客队近期比赛不可用",
+        ) or []
     home_recent = _valid_recent_matches(home_recent_rows, actual_home.id)
     away_recent = _valid_recent_matches(away_recent_rows, actual_away.id)
     deep_stats_limit = _deep_stats_limit(active_mode)
@@ -175,7 +207,9 @@ def run_auto_prediction(
 
     home_stats = None
     away_stats = None
-    if league_id and season:
+    if historical_mode:
+        notes.append("历史赛前模拟：跳过 API 赛季统计，避免使用赛后汇总数据穿越。")
+    elif league_id and season:
         home_stats = _safe_call(
             lambda: source.team_statistics(league_id, season, actual_home.id),
             notes,
@@ -189,11 +223,17 @@ def run_auto_prediction(
     else:
         notes.append("赛事缺少 league/season，无法拉取球队赛季统计。")
 
+    h2h_limit = 30 if historical_mode else 10
     h2h_rows = _safe_call(
-        lambda: source.last_head_to_head(actual_home.id, actual_away.id),
+        lambda: _last_h2h(source, actual_home.id, actual_away.id, h2h_limit),
         notes,
         "历史交锋不可用",
     ) or []
+    if historical_mode and historical_cutoff:
+        before_count = len(h2h_rows)
+        h2h_rows = _rows_before_cutoff(h2h_rows, historical_cutoff, limit=10)
+        if before_count != len(h2h_rows):
+            notes.append(f"历史赛前模拟：历史交锋已按开赛前截断，排除 {before_count - len(h2h_rows)} 场未来交锋。")
 
     prior_recent_weight = _prior_recent_weight(active_mode, league_meta)
     home_profile = _profile_from_api(actual_home, home_stats, home_recent, prior_recent_weight=prior_recent_weight)
@@ -224,6 +264,19 @@ def run_auto_prediction(
         away_recent_matches=len(away_recent),
         required_recent_matches=MIN_VALID_RECENT_MATCHES,
     )
+    score_distribution_calibration = score_distribution_calibration or build_score_distribution_calibration_status()
+    risk_context = dict(risk_context)
+    risk_context["scoreDistributionCalibration"] = score_distribution_calibration
+    score_markets = score_distribution_calibration.get("markets") or {}
+    total_market = score_markets.get("OU") or {}
+    handicap_market = score_markets.get("AH") or {}
+    notes.append(
+        "比分分布独立校准："
+        f"总样本 {score_distribution_calibration.get('sampleCount', 0)} 条；"
+        f"大小球 {total_market.get('statusLabel') or '-'}，"
+        f"让球 {handicap_market.get('statusLabel') or '-'}；"
+        "按共享版口径输出 paper_EV 纸上模拟层，formal_EV 仍需 pfinal 审批。"
+    )
     if risk_context.get("lambdaShrinkFactor", 1.0) < 1.0:
         notes.append(
             "λ 收缩已启用："
@@ -246,6 +299,9 @@ def run_auto_prediction(
         min_edge=min_edge,
         force_picks=force_picks,
         risk_context=risk_context,
+        starting_bankroll=starting_bankroll,
+        realized_pnl=realized_pnl,
+        reserved_stake=reserved_stake,
     )
     team_stats_available = recent_form_available
     if not recent_form_available:
@@ -261,6 +317,7 @@ def run_auto_prediction(
 
     venue = fixture_meta.get("venue") or {}
     venue_text = ", ".join(part for part in [str(venue.get("name") or ""), str(venue.get("city") or "")] if part)
+    snapshot_fixture_row = _fixture_without_result(fixture_row) if historical_mode else fixture_row
     return AutoPrediction(
         fixture_id=fixture_api_id,
         league_id=league_id,
@@ -297,7 +354,7 @@ def run_auto_prediction(
                 "cache_hits": int(getattr(source, "cache_hits", 0) or 0),
                 "cache_misses": int(getattr(source, "cache_misses", 0) or 0),
             },
-            "fixture": fixture_row,
+            "fixture": snapshot_fixture_row,
             "odds": odds_rows or [],
             "team_stats": {
                 "home": home_stats,
@@ -313,8 +370,18 @@ def run_auto_prediction(
             "h2h": h2h_rows,
             "notes": list(notes),
             "risk_context": risk_context,
+            "historical_mode": historical_mode,
+            "historical_as_of": historical_cutoff.isoformat() if historical_cutoff else None,
+            "leakage_policy": (
+                "fixture, recent_form, h2h and odds are cutoff before kickoff/as_of; "
+                "team season aggregate stats are disabled in historical mode."
+                if historical_mode
+                else "normal pre-match snapshot"
+            ),
         },
         risk_context=risk_context,
+        historical_mode=historical_mode,
+        historical_as_of=historical_cutoff.isoformat() if historical_cutoff else None,
     )
 
 
@@ -566,30 +633,63 @@ def _enrich_recent_matches_with_deep_stats(
     *,
     limit: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    enriched: list[dict[str, Any]] = []
+    enriched: list[dict[str, Any] | None] = [None] * len(rows)
     successful = 0
+    jobs: list[tuple[int, dict[str, Any], int]] = []
     for index, row in enumerate(rows):
-        if index >= limit:
-            enriched.append(row)
-            continue
         fixture_id = _optional_int(row.get("fixture_id"))
-        if fixture_id is None:
-            enriched.append(row)
-            continue
-        statistics = _safe_call(
-            lambda fixture_id=fixture_id: client.fixture_statistics(fixture_id),
-            notes,
-            f"{role_label}历史比赛 {fixture_id} 技术统计不可用",
-        ) or []
-        events = _safe_call(
-            lambda fixture_id=fixture_id: client.fixture_events(fixture_id),
-            notes,
-            f"{role_label}历史比赛 {fixture_id} 事件数据不可用",
-        ) or []
-        details = _technical_detail_for_team(statistics, events, team_id)
-        successful += 1 if details.get("technical_available") else 0
-        enriched.append({**row, **details})
-    return enriched, successful
+        if index >= limit or fixture_id is None:
+            enriched[index] = row
+        else:
+            jobs.append((index, row, fixture_id))
+
+    if not jobs:
+        return [item for item in enriched if item is not None], 0
+
+    workers = max(1, min(len(jobs), env_int("WORLDCUP_DEEP_FETCH_WORKERS", 4)))
+    if workers == 1:
+        for index, row, fixture_id in jobs:
+            result, job_notes = _deep_stats_for_recent_match(client, row, team_id, fixture_id, role_label)
+            notes.extend(job_notes)
+            successful += 1 if result.get("technical_available") else 0
+            enriched[index] = result
+        return [item for item in enriched if item is not None], successful
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_deep_stats_for_recent_match, client, row, team_id, fixture_id, role_label): index
+            for index, row, fixture_id in jobs
+        }
+        for future in as_completed(future_map):
+            index = future_map[future]
+            result, job_notes = future.result()
+            notes.extend(job_notes)
+            successful += 1 if result.get("technical_available") else 0
+            enriched[index] = result
+
+    return [item for item in enriched if item is not None], successful
+
+
+def _deep_stats_for_recent_match(
+    client: ApiFootballClient,
+    row: dict[str, Any],
+    team_id: int,
+    fixture_id: int,
+    role_label: str,
+) -> tuple[dict[str, Any], list[str]]:
+    job_notes: list[str] = []
+    statistics = _safe_call(
+        lambda fixture_id=fixture_id: client.fixture_statistics(fixture_id),
+        job_notes,
+        f"{role_label}历史比赛 {fixture_id} 技术统计不可用",
+    ) or []
+    events = _safe_call(
+        lambda fixture_id=fixture_id: client.fixture_events(fixture_id),
+        job_notes,
+        f"{role_label}历史比赛 {fixture_id} 事件数据不可用",
+    ) or []
+    details = _technical_detail_for_team(statistics, events, team_id)
+    return {**row, **details}, job_notes
 
 
 def _technical_detail_for_team(
@@ -697,6 +797,129 @@ def _validate_pre_match_fixture(fixture_meta: dict[str, Any], now: datetime | No
     reference_time = now or datetime.now(timezone.utc)
     if kickoff <= reference_time:
         raise ValueError("该比赛已超过开赛时间，不能作为赛前预测或校准样本。")
+
+
+def _historical_cutoff_from_fixture(
+    fixture_meta: dict[str, Any],
+    historical_as_of: str | datetime | None,
+) -> datetime:
+    kickoff = _parse_api_datetime(str(fixture_meta.get("date") or ""))
+    if kickoff is None:
+        raise ValueError("历史赛前模拟需要比赛开赛时间，当前 fixture 缺少可解析时间。")
+
+    if isinstance(historical_as_of, datetime):
+        cutoff = historical_as_of
+    else:
+        text = str(historical_as_of or "").strip()
+        cutoff = _parse_api_datetime(text) if text else None
+
+    if cutoff is None:
+        cutoff = kickoff - timedelta(minutes=1)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    if cutoff >= kickoff:
+        raise ValueError("历史赛前模拟的截止时间必须早于比赛开赛时间，避免赛后信息穿越。")
+    return cutoff
+
+
+def _team_recent_rows_before_cutoff(
+    source: ApiFootballClient,
+    team_id: int,
+    cutoff: datetime,
+    notes: list[str],
+    role_label: str,
+) -> list[dict[str, Any]]:
+    fetch_limit = max(RECENT_MATCH_FETCH_COUNT * 4, 20)
+    cutoff_date = (cutoff - timedelta(seconds=1)).date().isoformat()
+    method = getattr(source, "team_finished_fixtures_until", None)
+    rows: list[dict[str, Any]] = []
+    if callable(method):
+        rows = _safe_call(
+            lambda: method(team_id, cutoff_date, fetch_limit),
+            notes,
+            f"{role_label}历史赛前近期比赛不可用",
+        ) or []
+    if not rows:
+        rows = _safe_call(
+            lambda: source.team_last_fixtures(team_id, fetch_limit),
+            notes,
+            f"{role_label}近期比赛回退抓取不可用",
+        ) or []
+        if rows:
+            notes.append(f"{role_label}历史赛前样本使用回退过滤：API 未提供截止日前专用列表，已按开赛时间本地剔除未来比赛。")
+
+    filtered = _rows_before_cutoff(rows, cutoff, limit=fetch_limit)
+    completed = [
+        item for item in filtered
+        if str((((item.get("fixture") or {}).get("status") or {}).get("short") or "")).upper() in {"FT", "AET", "PEN"}
+    ]
+    return completed[:RECENT_MATCH_FETCH_COUNT]
+
+
+def _rows_before_cutoff(rows: list[dict[str, Any]], cutoff: datetime, *, limit: int) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    cutoff_utc = cutoff.astimezone(timezone.utc)
+    for row in rows:
+        fixture = row.get("fixture") or {}
+        fixture_time = _parse_api_datetime(str(fixture.get("date") or ""))
+        if fixture_time is None:
+            continue
+        if fixture_time.astimezone(timezone.utc) >= cutoff_utc:
+            continue
+        filtered.append(row)
+    return sorted(
+        filtered,
+        key=lambda item: str(((item.get("fixture") or {}).get("date") or "")),
+        reverse=True,
+    )[:limit]
+
+
+def _odds_rows_before_cutoff(rows: list[dict[str, Any]], cutoff: datetime) -> list[dict[str, Any]]:
+    cutoff_utc = cutoff.astimezone(timezone.utc)
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        updated_at = _parse_api_datetime(str(row.get("update") or row.get("updated") or ""))
+        if updated_at is None:
+            continue
+        if updated_at.astimezone(timezone.utc) <= cutoff_utc:
+            filtered.append(row)
+    return filtered
+
+
+def _last_h2h(source: ApiFootballClient, team_a_id: int, team_b_id: int, limit: int) -> list[dict[str, Any]]:
+    try:
+        return source.last_head_to_head(team_a_id, team_b_id, limit)
+    except TypeError:
+        return source.last_head_to_head(team_a_id, team_b_id)
+
+
+def _parse_api_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _fixture_without_result(row: dict[str, Any]) -> dict[str, Any]:
+    sanitized = copy.deepcopy(row)
+    sanitized.pop("goals", None)
+    sanitized.pop("score", None)
+    teams = sanitized.get("teams")
+    if isinstance(teams, dict):
+        for side in ("home", "away"):
+            team = teams.get(side)
+            if isinstance(team, dict):
+                team.pop("winner", None)
+    fixture = sanitized.get("fixture")
+    if isinstance(fixture, dict):
+        fixture["historical_asof_sanitized"] = True
+    return sanitized
 
 
 def _h2h_edge(rows: list[dict[str, Any]], home_team_id: int) -> float:

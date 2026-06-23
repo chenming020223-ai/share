@@ -188,3 +188,8 @@ class PredictionResult:
     score_matrix_probability_sum: float | None = None
     score_matrix_tail_mass: float | None = None
     lambda_risk_flags: tuple[str, ...] = ()
+    base_expected_goals_home: float | None = None
+    base_expected_goals_away: float | None = None
+    log_edge: float | None = None
+    home_exp_multiplier: float | None = None
+    away_exp_multiplier: float | None = None

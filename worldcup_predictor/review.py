@@ -1162,7 +1162,7 @@ def _sim_action(payload: dict[str, Any]) -> str:
     signal_statuses = {str(item.get("signal_status") or "") for item in recommendations}
     active = [item for item in recommendations if item.get("signal_status") == "PAPER_BUY"]
     if active:
-        return "纸上观察"
+        return "纸上模拟"
     if "SUSPENDED" in signal_statuses:
         return "暂停"
     if "MODEL_CANDIDATE" in signal_statuses:

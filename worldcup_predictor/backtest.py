@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .api_football import ApiFootballClient
-from .storage import pending_result_fixtures, prediction_payloads_with_results, record_match_result
+from .storage import (
+    pending_paper_ledger_result_fixtures,
+    pending_result_fixtures,
+    prediction_payloads_with_results,
+    record_match_result,
+)
 
 
 @dataclass(frozen=True)
@@ -129,9 +135,17 @@ def sync_completed_results(
     api_key: str | None = None,
     db_path: str | None = None,
     client: ApiFootballClient | None = None,
+    fixture_ids: list[str | int] | None = None,
 ) -> dict[str, Any]:
+    pending = sorted({str(item) for item in fixture_ids}) if fixture_ids is not None else pending_result_fixtures(db_path=db_path)
+    if not pending:
+        return {
+            "eligiblePending": 0,
+            "synced": [],
+            "awaitingCompletion": [],
+            "skippedWithoutFulltimeScore": [],
+        }
     source = client or ApiFootballClient(api_key=api_key)
-    pending = pending_result_fixtures(db_path=db_path)
     synced: list[str] = []
     awaiting: list[str] = []
     skipped: list[str] = []
@@ -159,6 +173,24 @@ def sync_completed_results(
         "awaitingCompletion": awaiting,
         "skippedWithoutFulltimeScore": skipped,
     }
+
+
+def sync_completed_paper_ledger_results(
+    api_key: str | None = None,
+    db_path: str | None = None,
+    client: ApiFootballClient | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    pending = pending_paper_ledger_result_fixtures(db_path=db_path, now=now)
+    result = sync_completed_results(
+        api_key=api_key,
+        db_path=db_path,
+        client=client,
+        fixture_ids=pending,
+    )
+    result["paperLedgerPending"] = pending
+    result["paperLedgerPendingCount"] = len(pending)
+    return result
 
 
 def _extract_completed_90_minute_result(fixture_row: dict[str, Any]) -> tuple[int, int] | None:

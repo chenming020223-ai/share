@@ -65,7 +65,6 @@ def build_match_risk_context(
         lambda_shrink_factor = 0.95
         reasons.append("成熟赛事且关键样本覆盖相对完整")
 
-    flags.append("FORMAL_EV_DISABLED")
     return {
         "leagueName": league_name,
         "leagueCountry": league_country,

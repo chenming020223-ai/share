@@ -4,20 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>世界杯预测 | 赛前分析工作台</title>
-    <link rel="icon" type="image/png" href="/assets/brand-mark.png" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="app-header">
         <div class="brand-lockup">
-          <img class="brand-mark" src="/assets/brand-mark.png" alt="世界杯预测" />
+          <img class="brand-mark" src="/logo.svg" alt="世界杯预测" />
           <div>
-            <p class="brand-kicker">赛前分析控制台</p>
-            <h1>世界杯预测</h1>
+            <p class="brand-kicker">分析控制台</p>
+            <h1>世界杯预测实验室</h1>
           </div>
         </div>
         <nav class="view-tabs" aria-label="分析视图">
+          <button type="button" class="view-tab" data-view="cabinView">模拟舱</button>
           <button type="button" class="view-tab active" data-view="workbenchView">预测工作台</button>
           <button type="button" class="view-tab" data-view="batchView">批量赛事池</button>
           <button type="button" class="view-tab" data-view="dataView">数据处理</button>
@@ -26,7 +27,6 @@
           <button type="button" class="view-tab" data-view="historyView">历史报告</button>
         </nav>
         <div class="header-state">
-          <span class="header-chip">90 分钟</span>
           <span id="statusPill" class="status-pill">API 检测中</span>
         </div>
       </header>
@@ -37,7 +37,7 @@
             <div class="rail-header">
               <div>
                 <p class="eyebrow">预测任务</p>
-                <h2>赛前赛事选择</h2>
+                <h2>赛事与参数</h2>
               </div>
               <span class="live-dot" title="赛前数据入口"></span>
             </div>
@@ -72,25 +72,34 @@
             </div>
             <div id="fixtureResults" class="fixture-results"></div>
             <label class="field">
-              <span>批量比赛 ID</span>
+              <span>批量 ID</span>
               <textarea id="batchFixtureIds" name="batchFixtureIds" rows="2" placeholder="多个 ID 用逗号、空格或换行分隔"></textarea>
             </label>
 
-            <div class="control-divider">
+            <div class="control-divider hidden-config">
               <p class="eyebrow">数据模式</p>
             </div>
-            <label class="field">
+            <label class="field hidden-config">
               <span>抓取深度</span>
               <select id="collectionMode" name="collectionMode">
-                <option value="deep" selected>深度模式：单场默认，补充近 10 场技术统计</option>
-                <option value="fast">快速模式：少量请求，只抓基础赛果与盘口</option>
+                <option value="deep" selected>深度模式：近 10 场 + 技术统计</option>
+                <option value="fast">快速模式：基础赛果 + 盘口</option>
               </select>
             </label>
-
-            <div class="control-divider">
-              <p class="eyebrow">资金与闸门参数</p>
+            <label class="field replay-control">
+              <span>回放时间</span>
+              <input id="historicalAsOf" name="historicalAsOf" type="datetime-local" />
+            </label>
+            <div class="rail-action-stack">
+              <button class="primary-action" type="submit">生成赛前分析</button>
+              <button id="historicalPredict" class="utility-action historical-action" type="button">历史回放</button>
             </div>
-            <div class="field-grid">
+            <p class="field-hint">已完赛回放；需比赛 ID。</p>
+
+            <div class="control-divider hidden-config">
+              <p class="eyebrow">资金与闸门</p>
+            </div>
+            <div class="field-grid hidden-config">
               <label class="field">
                 <span>启动资金</span>
                 <input id="bankroll" name="bankroll" type="number" min="1" step="1" value="1000" />
@@ -100,7 +109,7 @@
                 <input id="unit" name="unit" type="number" min="0" step="1" value="0" />
               </label>
             </div>
-            <div class="field-grid">
+            <div class="field-grid hidden-config">
               <label class="field">
                 <span>市场权重</span>
                 <input id="marketWeight" name="marketWeight" type="number" min="0" max="0.95" step="0.05" value="0.45" />
@@ -111,32 +120,60 @@
               </label>
             </div>
 
-            <div class="policy-note">
-              <strong>研究模式</strong>
-              <span>当前系统处于研究模拟阶段，pfinal 未批准，formal_EV 未开放。</span>
-              <span>research_EV 基于 pbase，仅用于研究观察；paper_EV 基于 qmkt 收缩后的 p_adj，仅用于纸上验证。</span>
-              <span>P_display 只用于页面理解，不参与 EV、推荐判断或资金计算。</span>
-              <span>大小球和让球依赖比分分布专项校准，U21、友谊赛、缺 xG 或技术统计时自动暂停。</span>
+            <div class="policy-note hidden-config">
+              <strong>纸上模拟模式</strong>
+              <span>模拟舱按滚动权益、未结算预留和 paper_EV 分档占用纸上资金；真实 pfinal/formal_EV 仍未开放。</span>
             </div>
-            <button class="primary-action" type="submit">生成赛前分析</button>
             <p id="formError" class="form-error" role="alert"></p>
           </form>
+          <div id="historyRailFacade" class="panel history-rail-facade" aria-label="批量赛事池">
+            <div class="rail-header">
+              <div>
+                <p class="eyebrow">批量赛事池</p>
+                <h2>批次回溯</h2>
+              </div>
+              <span class="live-dot" title="本地历史记录"></span>
+            </div>
+            <div id="historyRailContent" class="history-rail-content">
+              <div class="panel-placeholder">读取中</div>
+            </div>
+          </div>
         </aside>
 
         <section class="analysis-area">
           <div class="panel match-context">
             <div class="match-copy">
               <p class="eyebrow">当前分析对象</p>
-              <h2 id="matchTitle">请选择一场比赛</h2>
-              <p id="matchMeta" class="muted">等待真实赛前数据</p>
+              <h2 id="matchTitle">选择比赛</h2>
+              <p id="matchMeta" class="muted">等待数据</p>
             </div>
             <div class="summary-tags">
               <div class="confidence-tag" id="dataSource">API-Football</div>
               <div class="confidence-tag muted-tag" id="runId">运行 -</div>
+              <button id="openTrace" class="secondary-action" type="button" disabled>回溯数据</button>
               <button id="exportExcel" class="secondary-action" type="button" disabled>导出 Excel</button>
               <button id="exportPdf" class="secondary-action" type="button" disabled>导出 PDF</button>
             </div>
           </div>
+
+          <aside id="traceDrawer" class="panel trace-drawer" aria-label="单场回溯数据">
+            <div class="trace-head">
+              <div>
+                <p class="eyebrow">单场回溯</p>
+                <h2>回溯数据</h2>
+              </div>
+              <button class="mini-action trace-close" type="button" aria-label="关闭回溯">×</button>
+            </div>
+            <div class="trace-tabs" aria-label="回溯维度">
+              <button class="active" type="button">盘口快照</button>
+              <button type="button">近10场样本</button>
+              <button type="button">数据处理</button>
+              <button type="button">模拟舱原因</button>
+            </div>
+            <div id="traceDrawerContent" class="trace-content">
+              <div class="panel-placeholder">等待预测</div>
+            </div>
+          </aside>
 
           <section id="workbenchView" class="content-view active" aria-label="预测工作台">
             <div class="probability-grid" id="probabilityGrid">
@@ -162,7 +199,7 @@
                 <span id="portfolioSummary" class="muted"></span>
               </div>
               <div id="recommendations" class="recommendations">
-                <div class="panel-placeholder">完成赛前分析后显示方向与风险状态</div>
+                <div class="panel-placeholder">等待分析</div>
               </div>
             </div>
           </section>
@@ -177,7 +214,7 @@
             </div>
             <div class="panel batch-pool-panel">
               <div id="batchPoolContent" class="batch-pool-content">
-                <div class="panel-placeholder">完成批量分析后，这里会显示赛事池总览、筛选器、组合预案和单场钻取入口。</div>
+                <div class="panel-placeholder">等待批量结果</div>
               </div>
             </div>
           </section>
@@ -186,47 +223,48 @@
             <div class="panel data-head">
               <div>
                 <p class="eyebrow">证据链</p>
-                <h2>数据抓取与特征加工</h2>
+                <h2>抓取与加工</h2>
               </div>
               <div id="dataCoverage" class="coverage-status">等待生成分析</div>
             </div>
             <div class="processing-grid">
               <div class="panel process-panel">
-                <div class="section-header"><div><p class="eyebrow">处理流程</p><h2>数据流水线</h2></div></div>
-                <div id="processingSteps" class="process-steps"><div class="panel-placeholder">等待真实数据</div></div>
+                <div class="section-header"><div><p class="eyebrow">处理流程</p><h2>流水线</h2></div></div>
+                <div id="processingSteps" class="process-steps"><div class="panel-placeholder">等待数据</div></div>
               </div>
               <div class="panel metric-panel">
-                <div class="section-header"><div><p class="eyebrow">加工结果</p><h2>近期状态特征</h2></div></div>
-                <div id="processingMetrics" class="processing-metrics"><div class="panel-placeholder">等待真实数据</div></div>
+                <div class="section-header"><div><p class="eyebrow">加工结果</p><h2>状态特征</h2></div></div>
+                <div id="processingMetrics" class="processing-metrics"><div class="panel-placeholder">等待数据</div></div>
+                <div id="expEdgeAudit" class="exp-edge-audit"></div>
               </div>
             </div>
             <div class="chart-grid">
               <div class="panel chart-panel">
                 <div class="chart-header"><div><p class="eyebrow">主队走势</p><h2 id="homeChartTitle">近期进球与失球</h2></div><div class="chart-legend"><span class="line-orange"></span>进球 <span class="line-teal"></span>失球</div></div>
-                <div id="homeFormChart" class="line-chart"><div class="panel-placeholder">尚无趋势数据</div></div>
+                <div id="homeFormChart" class="line-chart"><div class="panel-placeholder">无趋势</div></div>
               </div>
               <div class="panel chart-panel">
                 <div class="chart-header"><div><p class="eyebrow">客队走势</p><h2 id="awayChartTitle">近期进球与失球</h2></div><div class="chart-legend"><span class="line-orange"></span>进球 <span class="line-teal"></span>失球</div></div>
-                <div id="awayFormChart" class="line-chart"><div class="panel-placeholder">尚无趋势数据</div></div>
+                <div id="awayFormChart" class="line-chart"><div class="panel-placeholder">无趋势</div></div>
               </div>
             </div>
             <div class="panel chart-panel points-panel">
               <div class="chart-header"><div><p class="eyebrow">模拟舱曲线</p><h2>近期资金与期望资金</h2></div><div class="chart-legend"><span class="line-orange"></span>资金 <span class="line-blue"></span>期望</div></div>
-              <div id="portfolioTrendChart" class="line-chart"><div class="panel-placeholder">尚无资金曲线</div></div>
+              <div id="portfolioTrendChart" class="line-chart"><div class="panel-placeholder">无曲线</div></div>
             </div>
             <div class="recent-grid">
               <div class="panel recent-panel">
                 <div class="section-header"><div><p class="eyebrow">原始赛果</p><h2 id="homeRecentTitle">主队近期比赛</h2></div></div>
-                <div id="homeRecentTable" class="recent-table"><div class="panel-placeholder">等待真实数据</div></div>
+                <div id="homeRecentTable" class="recent-table"><div class="panel-placeholder">等待数据</div></div>
               </div>
               <div class="panel recent-panel">
                 <div class="section-header"><div><p class="eyebrow">原始赛果</p><h2 id="awayRecentTitle">客队近期比赛</h2></div></div>
-                <div id="awayRecentTable" class="recent-table"><div class="panel-placeholder">等待真实数据</div></div>
+                <div id="awayRecentTable" class="recent-table"><div class="panel-placeholder">等待数据</div></div>
               </div>
             </div>
             <div class="panel trend-notice">
               <p class="eyebrow">赔率走势</p>
-              <p id="oddsTrendNotice">生成分析后检查是否具备多个赛前赔率快照。</p>
+              <p id="oddsTrendNotice">生成后检查快照。</p>
             </div>
           </section>
 
@@ -237,7 +275,7 @@
                   <div><p class="eyebrow">概率身份</p><h2>模型与盘口概率</h2></div>
                   <span id="bookmakerCount" class="muted"></span>
                 </div>
-                <div id="marketTable" class="table table-idle"><div class="panel-placeholder">等待真实比赛数据</div></div>
+                <div id="marketTable" class="table table-idle"><div class="panel-placeholder">等待数据</div></div>
                 <div id="modelAuditAlert" class="model-audit-alert hidden"></div>
               </div>
               <div class="panel formula-panel">
@@ -246,7 +284,7 @@
                 <div class="formula-flow">
                   <span>近期赛果</span><b>+</b><span>独立模型概率</span><b>+</b><span>优先庄家去水概率</span><b>→</b><span>风险闸门</span>
                 </div>
-                <p class="muted formula-note">胜平负按 pbase × 十进制赔率 - 1；大小球与让球按比分矩阵逐比分结算全赢、半赢、走水、半输、全输。正式校准通过前，仅作研究复核，不形成资金占用。</p>
+                <p class="muted formula-note">胜平负用 pbase × odds - 1；大小球/让球按比分矩阵结算。正式校准前仅研究。</p>
               </div>
             </div>
             <div class="governance-grid">
@@ -262,6 +300,7 @@
                 </div>
                 <span id="validationStatus" class="validation-status muted">读取中</span>
                 <div id="validationMetrics" class="validation-grid"></div>
+                <div id="marketValidationGrid" class="market-validation-grid"></div>
                 <p id="validationAction" class="muted validation-action"></p>
                 <ul id="validationNotes" class="validation-notes"></ul>
                 <div class="live-readiness">
@@ -275,7 +314,7 @@
             </div>
             <div class="panel notes-panel">
               <div class="section-header"><div><p class="eyebrow">运行信息</p><h2>数据提示</h2></div><span id="healthStatus" class="muted"></span></div>
-              <ul id="notesList"><li>等待数据提示</li></ul>
+              <ul id="notesList"><li>等待提示</li></ul>
             </div>
           </section>
 
@@ -297,10 +336,10 @@
             <div class="panel review-summary-panel">
               <div class="section-header">
                 <div><p class="eyebrow">整体表现</p><h2>复盘摘要</h2></div>
-                <span id="reviewStatus" class="muted">等待生成复盘</span>
+                <span id="reviewStatus" class="muted">等待复盘</span>
               </div>
               <div id="reviewSummary" class="review-summary-grid">
-                <div class="panel-placeholder">选择日期后生成复盘。</div>
+                <div class="panel-placeholder">选择日期</div>
               </div>
             </div>
             <div class="review-grid">
@@ -309,7 +348,7 @@
                 <div id="reviewBankroll" class="review-table"><div class="panel-placeholder">暂无资金事件</div></div>
               </div>
               <div class="panel review-table-panel">
-                <div class="section-header"><div><p class="eyebrow">异常归因</p><h2>高 EV 异常分组</h2></div><span class="muted">仅用于风险审计</span></div>
+                <div class="section-header"><div><p class="eyebrow">异常归因</p><h2>高 EV 分组</h2></div><span class="muted">风险审计</span></div>
                 <div id="reviewAnomalies" class="review-table"><div class="panel-placeholder">暂无异常数据</div></div>
               </div>
             </div>
@@ -332,19 +371,55 @@
               </div>
             </div>
             <div class="panel review-table-panel">
-              <div class="section-header"><div><p class="eyebrow">等待结算</p><h2>未完赛或未同步赛果</h2></div></div>
+              <div class="section-header"><div><p class="eyebrow">待结算</p><h2>未同步赛果</h2></div></div>
               <div id="reviewPending" class="review-table"><div class="panel-placeholder">暂无待结算比赛</div></div>
             </div>
           </section>
 
-          <section id="historyView" class="content-view" aria-label="历史报告">
+          <section id="cabinView" class="content-view" aria-label="模拟舱">
             <div class="panel chart-panel history-chart-panel">
-              <div class="chart-header"><div><p class="eyebrow">模拟舱曲线</p><h2>历史资金趋势</h2></div><div class="chart-legend"><span class="line-orange"></span>资金 <span class="line-blue"></span>期望</div></div>
-              <div id="historyBankrollChart" class="line-chart"><div class="panel-placeholder">正在读取资金曲线</div></div>
+              <div class="chart-header">
+                <div><p class="eyebrow">模拟舱账本</p><h2>资金曲线</h2></div>
+                <div class="chart-legend"><span class="line-teal"></span>资金 <em id="historyReplayStatus" class="muted">读取中</em></div>
+              </div>
+              <div id="historyBankrollChart" class="line-chart"><div class="panel-placeholder">读取中</div></div>
+              <div id="historyReplayLedger" class="history-replay-strip">
+                <div class="panel-placeholder">读取中</div>
+              </div>
             </div>
+            <div class="panel ledger-panel live-cabin-panel">
+              <div class="section-header">
+                <div><p class="eyebrow">实时持仓</p><h2>模拟舱</h2></div>
+                <span id="liveCabinStatus" class="muted">读取中</span>
+              </div>
+              <div id="liveCabin" class="live-cabin-grid">
+                <div class="panel-placeholder">读取中</div>
+              </div>
+            </div>
+            <div class="panel ledger-panel cabin-ledger-panel">
+              <div class="section-header">
+                <div><p class="eyebrow">本地账本</p><h2>比赛历史账本</h2></div>
+                <span id="historyLedgerStatus" class="muted">读取中</span>
+              </div>
+              <div id="historyLedger" class="ledger-table-wrap">
+                <div class="panel-placeholder">读取中</div>
+              </div>
+            </div>
+            <div class="panel history-preview-panel">
+              <div class="section-header">
+                <div><p class="eyebrow">单场回溯</p><h2>回溯预览</h2></div>
+                <span id="historyPreviewCrumbs" class="muted">批次 → 单场 → 回溯</span>
+              </div>
+              <div id="historyTracePreview" class="history-trace-preview">
+                <div class="panel-placeholder">选择历史记录</div>
+              </div>
+            </div>
+          </section>
+
+          <section id="historyView" class="content-view" aria-label="历史报告">
             <div class="panel history-panel">
-              <div class="section-header"><div><p class="eyebrow">本地留档</p><h2>近期预测与报告</h2></div><span class="muted">报告仅供研究复核</span></div>
-              <div id="historyList" class="history-list"><div class="panel-placeholder">正在读取记录</div></div>
+              <div class="section-header"><div><p class="eyebrow">本地留档</p><h2>近期报告</h2></div><span class="muted">研究复核</span></div>
+              <div id="historyList" class="history-list"><div class="panel-placeholder">读取中</div></div>
             </div>
           </section>
         </section>
