@@ -499,7 +499,9 @@ function renderBatchResult(data) {
   const filteredCollected = sortBatchItems(collectedItems, "priority");
   const filteredFailed = failedItems;
   const visibleCount = filteredCollected.length + filteredFailed.length;
-  const totalCount = summary.total ?? (collectedItems.length + failedItems.length);
+  const rawTotalCount = summary.total ?? (collectedItems.length + failedItems.length);
+  const requestedCount = Number(current.requestedCount);
+  const totalCount = Number.isFinite(requestedCount) && requestedCount > rawTotalCount ? requestedCount : rawTotalCount;
   const summaryCards = [
     ["批次", current.batchRunId ? `#${current.batchRunId}` : "-"],
     ["显示", `${visibleCount}/${totalCount}`],

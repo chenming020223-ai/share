@@ -836,10 +836,13 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
 def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
     date = str(payload.get("date") or _today_shanghai())
     scope = str(payload.get("scope") or "first_division")
-    max_limit = max(1, env_int("WORLDCUP_WEB_BATCH_LIMIT", 30))
-    default_limit = max(1, min(max_limit, env_int("WORLDCUP_WEB_BATCH_DEFAULT_LIMIT", 10)))
-    limit = max(1, min(max_limit, _optional_int(payload.get("limit")) or default_limit))
     requested_fixture_ids = _parse_fixture_ids(payload.get("fixtureIds") or payload.get("batchFixtureIds"))
+    max_limit = max(30, env_int("WORLDCUP_WEB_BATCH_LIMIT", 30))
+    default_limit = max(1, min(max_limit, env_int("WORLDCUP_WEB_BATCH_DEFAULT_LIMIT", 10)))
+    requested_limit = _optional_int(payload.get("limit"))
+    if requested_fixture_ids and requested_limit is None:
+        requested_limit = len(requested_fixture_ids)
+    limit = max(1, min(max_limit, requested_limit or default_limit))
     bankroll = as_float(payload.get("bankroll"), 1000.0)
     unit = _optional_float(payload.get("unit"))
     market_weight = clamp(as_float(payload.get("marketWeight"), 0.45), 0.0, 0.95)
@@ -933,6 +936,7 @@ def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
         "date": date,
         "scope": scope,
         "limit": limit,
+        "requestedCount": len(requested_fixture_ids) if requested_fixture_ids else limit,
         "fixtureIds": requested_fixture_ids,
         "candidateFixtures": len(fixtures),
         "collectedCount": len(collected),
