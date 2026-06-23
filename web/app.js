@@ -225,6 +225,8 @@ batchToday.addEventListener("click", async () => {
   }
 });
 
+batchFixtureIds.addEventListener("input", updateBatchButtonLabel);
+
 syncResults.addEventListener("click", async () => {
   const originalText = syncResults.textContent;
   syncResults.disabled = true;
@@ -289,6 +291,7 @@ form.addEventListener("submit", async (event) => {
 async function init() {
   appShell?.setAttribute("data-active-view", state.activeView);
   if (reviewDate) reviewDate.value = defaultReviewDate();
+  updateBatchButtonLabel();
   loadHealth();
   window.setTimeout(() => {
     loadHistory();
@@ -3020,6 +3023,12 @@ function addBatchFixtureId(fixtureId) {
   const fixtureIds = parseFixtureIds(batchFixtureIds.value);
   if (!fixtureIds.includes(String(fixtureId))) fixtureIds.push(String(fixtureId));
   batchFixtureIds.value = fixtureIds.join(", ");
+  updateBatchButtonLabel();
+}
+
+function updateBatchButtonLabel() {
+  const fixtureIds = parseFixtureIds(batchFixtureIds.value);
+  batchToday.textContent = fixtureIds.length ? `分析指定 ${fixtureIds.length} 场` : "批量分析 10 场";
 }
 
 function formatPercent(value) {
