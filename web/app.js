@@ -196,7 +196,7 @@ batchToday.addEventListener("click", async () => {
   fixtureResults.innerHTML = `<div class="fixture-empty">${
     fixtureIds.length
       ? `批量中：${fixtureIds.length} 场...`
-      : "批量中：今日前 5 场..."
+      : "批量中：今日前 10 场..."
   }</div>`;
   try {
     const response = await fetch("/api/batch-predict", {
@@ -205,7 +205,7 @@ batchToday.addEventListener("click", async () => {
       body: JSON.stringify({
         ...buildPayload(),
         scope: "first_division",
-        limit: fixtureIds.length || 5,
+        limit: fixtureIds.length || 10,
         fixtureIds,
         collectionMode: "batch",
       }),
