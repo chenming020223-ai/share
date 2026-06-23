@@ -836,8 +836,9 @@ def run_random_today_prediction(payload: dict[str, Any]) -> dict[str, Any]:
 def run_batch_prediction(payload: dict[str, Any]) -> dict[str, Any]:
     date = str(payload.get("date") or _today_shanghai())
     scope = str(payload.get("scope") or "first_division")
-    default_limit = env_int("WORLDCUP_WEB_BATCH_LIMIT", 10)
-    limit = max(1, min(default_limit, _optional_int(payload.get("limit")) or default_limit))
+    max_limit = max(1, env_int("WORLDCUP_WEB_BATCH_LIMIT", 30))
+    default_limit = max(1, min(max_limit, env_int("WORLDCUP_WEB_BATCH_DEFAULT_LIMIT", 10)))
+    limit = max(1, min(max_limit, _optional_int(payload.get("limit")) or default_limit))
     requested_fixture_ids = _parse_fixture_ids(payload.get("fixtureIds") or payload.get("batchFixtureIds"))
     bankroll = as_float(payload.get("bankroll"), 1000.0)
     unit = _optional_float(payload.get("unit"))

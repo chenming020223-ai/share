@@ -33,8 +33,10 @@ services:
         value: "true"
       - key: WORLDCUP_AUTO_SETTLEMENT_INTERVAL_SECONDS
         value: "300"
-      - key: WORLDCUP_WEB_BATCH_LIMIT
+      - key: WORLDCUP_WEB_BATCH_DEFAULT_LIMIT
         value: "10"
+      - key: WORLDCUP_WEB_BATCH_LIMIT
+        value: "30"
     disk:
       name: worldcup-storage
       mountPath: /opt/render/project/src/storage

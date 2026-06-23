@@ -1,3 +1,6 @@
+const DEFAULT_BATCH_LIMIT = 10;
+const MAX_BATCH_LIMIT = 30;
+
 const state = {
   currentRunId: null,
   activeView: "workbenchView",
@@ -46,6 +49,7 @@ const searchFixtures = document.querySelector("#searchFixtures");
 const todayFirstDivision = document.querySelector("#todayFirstDivision");
 const randomToday = document.querySelector("#randomToday");
 const batchToday = document.querySelector("#batchToday");
+const batchCount = document.querySelector("#batchCount");
 const batchFixtureIds = document.querySelector("#batchFixtureIds");
 const historicalPredict = document.querySelector("#historicalPredict");
 const syncResults = document.querySelector("#syncResults");
@@ -189,14 +193,14 @@ historicalPredict?.addEventListener("click", async () => {
 
 batchToday.addEventListener("click", async () => {
   formError.textContent = "";
-  const originalText = batchToday.textContent;
   const fixtureIds = parseFixtureIds(batchFixtureIds.value);
+  const batchLimit = syncBatchLimitValue();
   batchToday.disabled = true;
   batchToday.textContent = "批量中";
   fixtureResults.innerHTML = `<div class="fixture-empty">${
     fixtureIds.length
-      ? `批量中：${fixtureIds.length} 场...`
-      : "批量中：今日前 10 场..."
+      ? `批量中：指定 ${fixtureIds.length} 场...`
+      : `批量中：今日前 ${batchLimit} 场...`
   }</div>`;
   try {
     const response = await fetch("/api/batch-predict", {
@@ -205,7 +209,7 @@ batchToday.addEventListener("click", async () => {
       body: JSON.stringify({
         ...buildPayload(),
         scope: "first_division",
-        limit: fixtureIds.length || 10,
+        limit: fixtureIds.length || batchLimit,
         fixtureIds,
         collectionMode: "batch",
       }),
@@ -221,10 +225,15 @@ batchToday.addEventListener("click", async () => {
     formError.textContent = toChineseError(error.message);
   } finally {
     batchToday.disabled = false;
-    batchToday.textContent = originalText;
+    updateBatchButtonLabel();
   }
 });
 
+batchCount.addEventListener("input", updateBatchButtonLabel);
+batchCount.addEventListener("change", () => {
+  syncBatchLimitValue();
+  updateBatchButtonLabel();
+});
 batchFixtureIds.addEventListener("input", updateBatchButtonLabel);
 
 syncResults.addEventListener("click", async () => {
@@ -3026,9 +3035,22 @@ function addBatchFixtureId(fixtureId) {
   updateBatchButtonLabel();
 }
 
+function selectedBatchLimit() {
+  const value = Number.parseInt(batchCount?.value, 10);
+  if (!Number.isFinite(value)) return DEFAULT_BATCH_LIMIT;
+  return Math.max(1, Math.min(MAX_BATCH_LIMIT, value));
+}
+
+function syncBatchLimitValue() {
+  const limit = selectedBatchLimit();
+  if (batchCount) batchCount.value = String(limit);
+  return limit;
+}
+
 function updateBatchButtonLabel() {
   const fixtureIds = parseFixtureIds(batchFixtureIds.value);
-  batchToday.textContent = fixtureIds.length ? `分析指定 ${fixtureIds.length} 场` : "批量分析 10 场";
+  const batchLimit = selectedBatchLimit();
+  batchToday.textContent = fixtureIds.length ? `分析指定 ${fixtureIds.length} 场` : `批量分析 ${batchLimit} 场`;
 }
 
 function formatPercent(value) {

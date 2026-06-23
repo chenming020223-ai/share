@@ -72,8 +72,12 @@
             </div>
             <div id="fixtureResults" class="fixture-results"></div>
             <label class="field">
+              <span>批量场数</span>
+              <input id="batchCount" name="batchCount" type="number" min="1" max="30" step="1" value="10" />
+            </label>
+            <label class="field">
               <span>批量 ID</span>
-              <textarea id="batchFixtureIds" name="batchFixtureIds" rows="2" placeholder="留空=今日前 10 场；填写 ID=只分析指定比赛"></textarea>
+              <textarea id="batchFixtureIds" name="batchFixtureIds" rows="2" placeholder="留空=按批量场数抓今日比赛；填写 ID=只分析指定比赛"></textarea>
             </label>
 
             <div class="control-divider hidden-config">
